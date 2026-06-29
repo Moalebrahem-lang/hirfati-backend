@@ -88,10 +88,58 @@ db.exec(`
   );
 `);
 
-// Seed admin account
-const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get('0900000000');
-if (!adminExists) {
-  db.prepare('INSERT INTO users (id, name, phone, role, city, avatar) VALUES (?, ?, ?, ?, ?, ?)').run('admin', 'مدير النظام', '0900000000', 'admin', 'دمشق', 'مد');
-}
+// Seed demo accounts without touching the rest of the database.
+const seedUser = db.prepare(`
+  INSERT INTO users (id, name, phone, role, city, avatar, specialty, verified, warranty, bio)
+  VALUES (@id, @name, @phone, @role, @city, @avatar, @specialty, @verified, @warranty, @bio)
+  ON CONFLICT(phone) DO UPDATE SET
+    name = excluded.name,
+    role = excluded.role,
+    city = excluded.city,
+    avatar = excluded.avatar,
+    specialty = excluded.specialty,
+    verified = excluded.verified,
+    warranty = excluded.warranty,
+    bio = excluded.bio
+`);
+
+[
+  {
+    id: 'demo-client',
+    name: 'عميل تجريبي',
+    phone: '0991112233',
+    role: 'client',
+    city: 'دمشق',
+    avatar: 'عم',
+    specialty: null,
+    verified: 1,
+    warranty: 0,
+    bio: ''
+  },
+  {
+    id: 'demo-craftsman',
+    name: 'حرفي تجريبي',
+    phone: '0944556677',
+    role: 'craftsman',
+    city: 'دمشق',
+    avatar: 'حر',
+    specialty: 'كهرباء',
+    verified: 1,
+    warranty: 1,
+    bio: 'حساب حرفي تجريبي لاختبار التطبيق.'
+  },
+  {
+    id: 'admin',
+    name: 'مدير النظام',
+    phone: '0900000000',
+    role: 'admin',
+    city: 'دمشق',
+    avatar: 'مد',
+    specialty: null,
+    verified: 1,
+    warranty: 0,
+    bio: ''
+  }
+].forEach(user => seedUser.run(user));
 
 module.exports = db;
