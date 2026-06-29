@@ -136,7 +136,7 @@ app.post('/api/messages', authenticate, (req, res) => {
 
 // --- NOTIFICATIONS ---
 app.get('/api/notifications', authenticate, (req, res) => {
-  res.json(db.prepare('SELECT * FROM notifications WHERE userId=? OR userId="all" ORDER BY at DESC').all(req.user.id));
+  res.json(db.prepare('SELECT * FROM notifications WHERE userId=? OR userId=? ORDER BY at DESC').all(req.user.id, 'all'));
 });
 
 app.post('/api/notifications/read', authenticate, (req, res) => {
