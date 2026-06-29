@@ -1,21 +1,23 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const db = require('./db');
+const { connect, cols, stripMongoId, normalizeMany } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const SECRET = 'hirfati-secret-key-2024';
+const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
+const API_ORIGIN = process.env.CORS_ORIGIN || '*';
 
-app.use(cors());
+app.use(cors({ origin: API_ORIGIN }));
 app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static(path.join(__dirname, '../frontend/build')));
 
-// Multer setup
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = path.join(__dirname, 'uploads');
@@ -23,22 +25,42 @@ const storage = multer.diskStorage({
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname));
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(file.originalname)}`);
   }
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
+const id = prefix => prefix + Math.random().toString(36).slice(2, 10);
+
+const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
-  try { req.user = jwt.verify(token, SECRET); next(); }
-  catch (err) { res.status(401).json({ error: 'Invalid token' }); }
+  try {
+    req.user = jwt.verify(token, SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
 };
 
-function addNotif(userId, type, text, jobId) {
-  const id = 'n' + Math.random().toString(36).slice(2, 10);
-  db.prepare('INSERT INTO notifications (id, userId, type, text, jobId, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, userId, type, text, jobId || null, Date.now());
+async function addNotif(userId, type, text, jobId) {
+  await cols().notifications.insertOne({
+    id: id('n'),
+    userId,
+    type,
+    text,
+    jobId: jobId || null,
+    at: Date.now(),
+    read: 0
+  });
 }
+
+app.get('/api/health', asyncRoute(async (req, res) => {
+  await connect();
+  res.json({ ok: true, db: 'mongodb', at: Date.now() });
+}));
 
 // --- AUTH ---
 app.post('/api/auth/otp', (req, res) => {
@@ -47,137 +69,247 @@ app.post('/api/auth/otp', (req, res) => {
   res.json({ message: 'OTP sent' });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const { phone, otp, name, role, city, specialty } = req.body;
   if (otp !== '1234') return res.status(400).json({ error: 'Invalid OTP' });
-  let user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+
+  const { users } = cols();
+  let user = await users.findOne({ phone });
   if (!user) {
     if (!name) return res.status(404).json({ error: 'User not found', needsRegistration: true });
-    const id = 'u' + Math.random().toString(36).slice(2, 10);
-    const avatar = (name || '').slice(0, 2);
-    db.prepare('INSERT INTO users (id, name, phone, role, city, avatar, specialty) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, phone, role || 'client', city || 'دمشق', avatar, specialty || null);
-    user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const newUser = {
+      id: id('u'),
+      name,
+      phone,
+      role: role || 'client',
+      city: city || 'دمشق',
+      avatar: (name || '').slice(0, 2),
+      specialty: role === 'craftsman' ? (specialty || null) : null,
+      rating: 0,
+      reviewsCount: 0,
+      bio: '',
+      verified: 0,
+      warranty: 0,
+      jobsDone: 0,
+      range: 25,
+      saved: []
+    };
+    await users.insertOne(newUser);
+    user = newUser;
   }
+
+  user = stripMongoId(user);
   const token = jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { ...user, saved: JSON.parse(user.saved || '[]') } });
-});
+  res.json({ token, user });
+}));
 
 // --- USERS ---
-app.get('/api/users/me', authenticate, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
+  const user = await cols().users.findOne({ id: req.user.id });
   if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json({ ...user, saved: JSON.parse(user.saved || '[]') });
-});
+  res.json(stripMongoId(user));
+}));
 
-app.put('/api/users/profile', authenticate, (req, res) => {
+app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
   const { name, city, bio, range, avatar, specialty } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
-  db.prepare('UPDATE users SET name=?, city=?, bio=?, range=?, avatar=?, specialty=? WHERE id=?').run(
-    name||user.name, city||user.city, bio!==undefined?bio:user.bio, range||user.range, avatar||user.avatar, specialty||user.specialty, req.user.id
+  const current = await cols().users.findOne({ id: req.user.id });
+  if (!current) return res.status(404).json({ error: 'Not found' });
+
+  await cols().users.updateOne(
+    { id: req.user.id },
+    {
+      $set: {
+        name: name || current.name,
+        city: city || current.city,
+        bio: bio !== undefined ? bio : current.bio,
+        range: range || current.range,
+        avatar: avatar || current.avatar,
+        specialty: specialty || current.specialty
+      }
+    }
   );
   res.json({ success: true });
-});
+}));
 
-app.get('/api/users/craftsmen', authenticate, (req, res) => {
-  const all = db.prepare('SELECT * FROM users WHERE role IN (?, ?)').all('craftsman', 'client');
-  res.json(all.map(u => ({ ...u, saved: JSON.parse(u.saved || '[]') })));
-});
+app.get('/api/users/craftsmen', authenticate, asyncRoute(async (req, res) => {
+  const users = await cols().users.find({ role: { $in: ['craftsman', 'client'] } }).sort({ role: 1, name: 1 }).toArray();
+  res.json(normalizeMany(users));
+}));
 
 // --- JOBS ---
-app.get('/api/jobs', authenticate, (req, res) => {
-  const jobs = db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
-  res.json(jobs.map(j => ({ ...j, photos: JSON.parse(j.photos || '[]') })));
-});
+app.get('/api/jobs', authenticate, asyncRoute(async (req, res) => {
+  const jobs = await cols().jobs.find({}).sort({ createdAt: -1 }).toArray();
+  res.json(normalizeMany(jobs));
+}));
 
-app.post('/api/jobs', authenticate, (req, res) => {
+app.post('/api/jobs', authenticate, asyncRoute(async (req, res) => {
   const { title, desc, category, city, area, photos } = req.body;
-  const id = 'j' + Math.random().toString(36).slice(2, 10);
-  db.prepare('INSERT INTO jobs (id, title, desc, category, city, area, distance, createdAt, clientId, photos) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, title, desc, category, city, area||city, Math.floor(Math.random()*20)+1, Date.now(), req.user.id, JSON.stringify(photos||[]));
-  res.json({ id });
-});
+  const job = {
+    id: id('j'),
+    title,
+    desc,
+    category,
+    city,
+    area: area || city,
+    distance: Math.floor(Math.random() * 20) + 1,
+    createdAt: Date.now(),
+    clientId: req.user.id,
+    status: 'open',
+    photos: photos || [],
+    chosenCraftsman: null,
+    cancelReason: null
+  };
+  await cols().jobs.insertOne(job);
+  res.json({ id: job.id });
+}));
 
-app.put('/api/jobs/:id/status', authenticate, (req, res) => {
+app.put('/api/jobs/:id/status', authenticate, asyncRoute(async (req, res) => {
   const { status, chosenCraftsman, cancelReason } = req.body;
-  db.prepare('UPDATE jobs SET status=?, chosenCraftsman=?, cancelReason=? WHERE id=?').run(status, chosenCraftsman||null, cancelReason||null, req.params.id);
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
-  if (status==='matched' && chosenCraftsman) addNotif(chosenCraftsman, 'match', `بدأ العميل المحادثة معك: ${job.title.slice(0,30)}`, job.id);
-  if (status==='cancelled' && job.chosenCraftsman) addNotif(job.chosenCraftsman, 'cancel', `تم إلغاء الطلب: ${job.title.slice(0,30)}`, job.id);
+  await cols().jobs.updateOne(
+    { id: req.params.id },
+    { $set: { status, chosenCraftsman: chosenCraftsman || null, cancelReason: cancelReason || null } }
+  );
+  const job = await cols().jobs.findOne({ id: req.params.id });
+  if (!job) return res.status(404).json({ error: 'Not found' });
+  if (status === 'matched' && chosenCraftsman) await addNotif(chosenCraftsman, 'match', `بدأ العميل المحادثة معك: ${job.title.slice(0, 30)}`, job.id);
+  if (status === 'cancelled' && job.chosenCraftsman) await addNotif(job.chosenCraftsman, 'cancel', `تم إلغاء الطلب: ${job.title.slice(0, 30)}`, job.id);
   res.json({ success: true });
-});
+}));
 
 // --- INTERESTS ---
-app.get('/api/interests', authenticate, (req, res) => {
-  res.json(db.prepare('SELECT * FROM interests').all());
-});
+app.get('/api/interests', authenticate, asyncRoute(async (req, res) => {
+  const interests = await cols().interests.find({}).sort({ createdAt: -1 }).toArray();
+  res.json(normalizeMany(interests));
+}));
 
-app.post('/api/interests', authenticate, (req, res) => {
+app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
   const { jobId, note, estimate } = req.body;
-  const id = 'i' + Math.random().toString(36).slice(2, 10);
-  db.prepare('INSERT INTO interests (id, jobId, craftsmanId, note, estimate, createdAt) VALUES (?, ?, ?, ?, ?, ?)').run(id, jobId, req.user.id, note||null, estimate||null, Date.now());
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
-  const craftsman = db.prepare('SELECT name FROM users WHERE id = ?').get(req.user.id);
-  if (job) addNotif(job.clientId, 'interest', `${craftsman?.name||'حرفي'} مهتم بطلبك: ${job.title.slice(0,30)}`, jobId);
-  res.json({ id });
-});
+  const interest = {
+    id: id('i'),
+    jobId,
+    craftsmanId: req.user.id,
+    note: note || null,
+    estimate: estimate || null,
+    createdAt: Date.now()
+  };
+  await cols().interests.insertOne(interest);
+
+  const [job, craftsman] = await Promise.all([
+    cols().jobs.findOne({ id: jobId }),
+    cols().users.findOne({ id: req.user.id }, { projection: { name: 1 } })
+  ]);
+  if (job) await addNotif(job.clientId, 'interest', `${craftsman?.name || 'حرفي'} مهتم بطلبك: ${job.title.slice(0, 30)}`, jobId);
+  res.json({ id: interest.id });
+}));
 
 // --- MESSAGES ---
-app.get('/api/messages', authenticate, (req, res) => {
-  res.json(db.prepare('SELECT * FROM messages WHERE senderId=? OR receiverId=? ORDER BY at ASC').all(req.user.id, req.user.id));
-});
+app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
+  const messages = await cols().messages.find({
+    $or: [{ senderId: req.user.id }, { receiverId: req.user.id }]
+  }).sort({ at: 1 }).toArray();
+  res.json(normalizeMany(messages));
+}));
 
-app.post('/api/messages', authenticate, (req, res) => {
+app.post('/api/messages', authenticate, asyncRoute(async (req, res) => {
   const { jobId, receiverId, text } = req.body;
-  const id = 'm' + Math.random().toString(36).slice(2, 10);
-  db.prepare('INSERT INTO messages (id, jobId, senderId, receiverId, text, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, jobId, req.user.id, receiverId, text, Date.now());
-  const sender = db.prepare('SELECT name FROM users WHERE id = ?').get(req.user.id);
-  addNotif(receiverId, 'msg', `رسالة من ${sender?.name||'مستخدم'}`, jobId);
-  res.json({ id });
-});
+  const message = {
+    id: id('m'),
+    jobId,
+    senderId: req.user.id,
+    receiverId,
+    text,
+    at: Date.now()
+  };
+  await cols().messages.insertOne(message);
+
+  const sender = await cols().users.findOne({ id: req.user.id }, { projection: { name: 1 } });
+  await addNotif(receiverId, 'msg', `رسالة من ${sender?.name || 'مستخدم'}`, jobId);
+  res.json({ id: message.id });
+}));
 
 // --- NOTIFICATIONS ---
-app.get('/api/notifications', authenticate, (req, res) => {
-  res.json(db.prepare('SELECT * FROM notifications WHERE userId=? OR userId=? ORDER BY at DESC').all(req.user.id, 'all'));
-});
+app.get('/api/notifications', authenticate, asyncRoute(async (req, res) => {
+  const notifications = await cols().notifications.find({
+    userId: { $in: [req.user.id, 'all'] }
+  }).sort({ at: -1 }).toArray();
+  res.json(normalizeMany(notifications));
+}));
 
-app.post('/api/notifications/read', authenticate, (req, res) => {
-  db.prepare('UPDATE notifications SET read=1 WHERE userId=?').run(req.user.id);
+app.post('/api/notifications/read', authenticate, asyncRoute(async (req, res) => {
+  await cols().notifications.updateMany({ userId: req.user.id }, { $set: { read: 1 } });
   res.json({ success: true });
-});
+}));
 
 // --- REVIEWS ---
-app.get('/api/reviews', authenticate, (req, res) => {
-  res.json(db.prepare('SELECT * FROM reviews ORDER BY at DESC').all());
-});
+app.get('/api/reviews', authenticate, asyncRoute(async (req, res) => {
+  const reviews = await cols().reviews.find({}).sort({ at: -1 }).toArray();
+  res.json(normalizeMany(reviews));
+}));
 
-app.post('/api/reviews', authenticate, (req, res) => {
+app.post('/api/reviews', authenticate, asyncRoute(async (req, res) => {
   const { craftsmanId, rating, title, text } = req.body;
-  const id = 'r' + Math.random().toString(36).slice(2, 10);
-  const client = db.prepare('SELECT name, city FROM users WHERE id = ?').get(req.user.id);
-  db.prepare('INSERT INTO reviews (id, craftsmanId, clientId, clientName, rating, title, text, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, craftsmanId, req.user.id, `${client?.name?.split(' ')[0]||'عميل'}، ${client?.city||''}`, rating, title, text, Date.now());
-  const stats = db.prepare('SELECT AVG(rating) as avg, COUNT(*) as count FROM reviews WHERE craftsmanId = ?').get(craftsmanId);
-  db.prepare('UPDATE users SET rating=?, reviewsCount=?, jobsDone=jobsDone+1 WHERE id=?').run(Math.round(stats.avg*10)/10, stats.count, craftsmanId);
-  addNotif(craftsmanId, 'review', `حصلت على تقييم ${rating} نجوم!`, null);
-  res.json({ id });
-});
+  const client = await cols().users.findOne({ id: req.user.id }, { projection: { name: 1, city: 1 } });
+  const review = {
+    id: id('r'),
+    craftsmanId,
+    clientId: req.user.id,
+    clientName: `${client?.name?.split(' ')[0] || 'عميل'}، ${client?.city || ''}`,
+    rating,
+    title,
+    text,
+    at: Date.now()
+  };
+  await cols().reviews.insertOne(review);
+
+  const stats = await cols().reviews.aggregate([
+    { $match: { craftsmanId } },
+    { $group: { _id: '$craftsmanId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+  ]).toArray();
+  const stat = stats[0] || { avg: 0, count: 0 };
+  await cols().users.updateOne(
+    { id: craftsmanId },
+    { $set: { rating: Math.round(stat.avg * 10) / 10, reviewsCount: stat.count }, $inc: { jobsDone: 1 } }
+  );
+  await addNotif(craftsmanId, 'review', `حصلت على تقييم ${rating} نجوم!`, null);
+  res.json({ id: review.id });
+}));
 
 // --- REPORTS ---
-app.post('/api/reports', authenticate, (req, res) => {
+app.post('/api/reports', authenticate, asyncRoute(async (req, res) => {
   const { type, targetId, reason } = req.body;
-  const id = 'rep' + Math.random().toString(36).slice(2, 10);
-  db.prepare('INSERT INTO reports (id, type, targetId, reason, byId, at) VALUES (?, ?, ?, ?, ?, ?)').run(id, type, targetId, reason, req.user.id, Date.now());
-  res.json({ id });
-});
+  const report = {
+    id: id('rep'),
+    type,
+    targetId,
+    reason,
+    byId: req.user.id,
+    at: Date.now()
+  };
+  await cols().reports.insertOne(report);
+  res.json({ id: report.id });
+}));
 
 // --- UPLOAD ---
 app.post('/api/upload', authenticate, upload.array('photos', 5), (req, res) => {
   res.json({ urls: req.files.map(f => `/uploads/${f.filename}`) });
 });
 
-// Catch-all
 app.get('*', (req, res) => {
   const idx = path.join(__dirname, '../frontend/build/index.html');
   if (fs.existsSync(idx)) res.sendFile(idx);
   else res.status(404).json({ error: 'Not found' });
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 حِرفتي running on port ${PORT}`));
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+connect()
+  .then(() => {
+    app.listen(PORT, '0.0.0.0', () => console.log(`🚀 حِرفتي running on port ${PORT} with MongoDB`));
+  })
+  .catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });

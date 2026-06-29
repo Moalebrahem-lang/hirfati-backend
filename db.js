@@ -1,109 +1,23 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+require('dotenv').config();
 
-const db = new Database(path.join(__dirname, 'hirfati.db'));
-db.pragma('journal_mode = WAL');
+const { MongoClient } = require('mongodb');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    phone TEXT UNIQUE NOT NULL,
-    role TEXT CHECK(role IN ('client', 'craftsman', 'admin')) NOT NULL,
-    city TEXT DEFAULT 'دمشق',
-    avatar TEXT,
-    specialty TEXT,
-    rating REAL DEFAULT 0,
-    reviewsCount INTEGER DEFAULT 0,
-    bio TEXT DEFAULT '',
-    verified INTEGER DEFAULT 0,
-    warranty INTEGER DEFAULT 0,
-    jobsDone INTEGER DEFAULT 0,
-    range INTEGER DEFAULT 25,
-    saved TEXT DEFAULT '[]'
-  );
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = process.env.MONGODB_DB || 'hirfati';
 
-  CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    desc TEXT NOT NULL,
-    category TEXT NOT NULL,
-    city TEXT NOT NULL,
-    area TEXT,
-    distance INTEGER DEFAULT 5,
-    createdAt INTEGER NOT NULL,
-    clientId TEXT NOT NULL,
-    status TEXT DEFAULT 'open',
-    photos TEXT DEFAULT '[]',
-    chosenCraftsman TEXT,
-    cancelReason TEXT
-  );
+if (!MONGODB_URI) {
+  throw new Error('MONGODB_URI is required. Set it to your MongoDB Atlas connection string.');
+}
 
-  CREATE TABLE IF NOT EXISTS interests (
-    id TEXT PRIMARY KEY,
-    jobId TEXT NOT NULL,
-    craftsmanId TEXT NOT NULL,
-    note TEXT,
-    estimate INTEGER,
-    createdAt INTEGER NOT NULL
-  );
+const client = new MongoClient(MONGODB_URI, {
+  maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 50),
+  minPoolSize: Number(process.env.MONGODB_MIN_POOL_SIZE || 2),
+  retryWrites: true
+});
 
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    jobId TEXT NOT NULL,
-    senderId TEXT NOT NULL,
-    receiverId TEXT NOT NULL,
-    text TEXT NOT NULL,
-    at INTEGER NOT NULL
-  );
+let database;
 
-  CREATE TABLE IF NOT EXISTS reviews (
-    id TEXT PRIMARY KEY,
-    craftsmanId TEXT NOT NULL,
-    clientId TEXT NOT NULL,
-    clientName TEXT NOT NULL,
-    rating INTEGER NOT NULL,
-    title TEXT,
-    text TEXT,
-    at INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS notifications (
-    id TEXT PRIMARY KEY,
-    userId TEXT NOT NULL,
-    type TEXT NOT NULL,
-    text TEXT NOT NULL,
-    jobId TEXT,
-    at INTEGER NOT NULL,
-    read INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS reports (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    targetId TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    byId TEXT NOT NULL,
-    at INTEGER NOT NULL
-  );
-`);
-
-// Seed demo accounts without touching the rest of the database.
-const seedUser = db.prepare(`
-  INSERT INTO users (id, name, phone, role, city, avatar, specialty, verified, warranty, bio)
-  VALUES (@id, @name, @phone, @role, @city, @avatar, @specialty, @verified, @warranty, @bio)
-  ON CONFLICT(phone) DO UPDATE SET
-    name = excluded.name,
-    role = excluded.role,
-    city = excluded.city,
-    avatar = excluded.avatar,
-    specialty = excluded.specialty,
-    verified = excluded.verified,
-    warranty = excluded.warranty,
-    bio = excluded.bio
-`);
-
-[
+const demoUsers = [
   {
     id: 'demo-client',
     name: 'عميل تجريبي',
@@ -112,9 +26,14 @@ const seedUser = db.prepare(`
     city: 'دمشق',
     avatar: 'عم',
     specialty: null,
+    rating: 0,
+    reviewsCount: 0,
+    bio: '',
     verified: 1,
     warranty: 0,
-    bio: ''
+    jobsDone: 0,
+    range: 25,
+    saved: []
   },
   {
     id: 'demo-craftsman',
@@ -124,9 +43,14 @@ const seedUser = db.prepare(`
     city: 'دمشق',
     avatar: 'حر',
     specialty: 'كهرباء',
+    rating: 0,
+    reviewsCount: 0,
+    bio: 'حساب حرفي تجريبي لاختبار التطبيق.',
     verified: 1,
     warranty: 1,
-    bio: 'حساب حرفي تجريبي لاختبار التطبيق.'
+    jobsDone: 0,
+    range: 25,
+    saved: []
   },
   {
     id: 'admin',
@@ -136,10 +60,99 @@ const seedUser = db.prepare(`
     city: 'دمشق',
     avatar: 'مد',
     specialty: null,
+    rating: 0,
+    reviewsCount: 0,
+    bio: '',
     verified: 1,
     warranty: 0,
-    bio: ''
+    jobsDone: 0,
+    range: 25,
+    saved: []
   }
-].forEach(user => seedUser.run(user));
+];
 
-module.exports = db;
+function stripMongoId(doc) {
+  if (!doc) return doc;
+  const { _id, ...rest } = doc;
+  return rest;
+}
+
+function normalizeMany(docs) {
+  return docs.map(stripMongoId);
+}
+
+async function createIndexes(db) {
+  await Promise.all([
+    db.collection('users').createIndex({ phone: 1 }, { unique: true }),
+    db.collection('users').createIndex({ id: 1 }, { unique: true }),
+    db.collection('users').createIndex({ role: 1, city: 1 }),
+    db.collection('jobs').createIndex({ id: 1 }, { unique: true }),
+    db.collection('jobs').createIndex({ createdAt: -1 }),
+    db.collection('jobs').createIndex({ status: 1, category: 1, city: 1 }),
+    db.collection('jobs').createIndex({ clientId: 1 }),
+    db.collection('interests').createIndex({ id: 1 }, { unique: true }),
+    db.collection('interests').createIndex({ jobId: 1, craftsmanId: 1 }),
+    db.collection('messages').createIndex({ jobId: 1, at: 1 }),
+    db.collection('messages').createIndex({ senderId: 1, receiverId: 1, at: 1 }),
+    db.collection('notifications').createIndex({ userId: 1, at: -1 }),
+    db.collection('reviews').createIndex({ craftsmanId: 1, at: -1 }),
+    db.collection('reports').createIndex({ targetId: 1, at: -1 })
+  ]);
+}
+
+async function seedDemoUsers(db) {
+  const users = db.collection('users');
+  await Promise.all(demoUsers.map(user => users.updateOne(
+    { phone: user.phone },
+    {
+      $set: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        city: user.city,
+        avatar: user.avatar,
+        specialty: user.specialty,
+        verified: user.verified,
+        warranty: user.warranty,
+        bio: user.bio
+      },
+      $setOnInsert: {
+        rating: user.rating,
+        reviewsCount: user.reviewsCount,
+        jobsDone: user.jobsDone,
+        range: user.range,
+        saved: user.saved
+      }
+    },
+    { upsert: true }
+  )));
+}
+
+async function connect() {
+  if (database) return database;
+  await client.connect();
+  database = client.db(DB_NAME);
+  await createIndexes(database);
+  await seedDemoUsers(database);
+  return database;
+}
+
+function cols() {
+  if (!database) throw new Error('Database is not connected yet.');
+  return {
+    users: database.collection('users'),
+    jobs: database.collection('jobs'),
+    interests: database.collection('interests'),
+    messages: database.collection('messages'),
+    notifications: database.collection('notifications'),
+    reviews: database.collection('reviews'),
+    reports: database.collection('reports')
+  };
+}
+
+module.exports = {
+  connect,
+  cols,
+  stripMongoId,
+  normalizeMany
+};
