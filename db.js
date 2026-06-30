@@ -102,7 +102,10 @@ async function createIndexes(db) {
     db.collection('otps').createIndex({ phone: 1, purpose: 1 }),
     db.collection('otps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     db.collection('passwordRecoveryLogs').createIndex({ phone: 1, at: -1 }),
-    db.collection('passwordRecoveryLogs').createIndex({ at: -1 })
+    db.collection('passwordRecoveryLogs').createIndex({ at: -1 }),
+    db.collection('auditLogs').createIndex({ type: 1, at: -1 }),
+    db.collection('auditLogs').createIndex({ userId: 1, at: -1 }),
+    db.collection('auditLogs').createIndex({ phone: 1, at: -1 })
   ]);
 }
 
@@ -190,7 +193,8 @@ function cols() {
     reviews: database.collection('reviews'),
     reports: database.collection('reports'),
     otps: database.collection('otps'),
-    passwordRecoveryLogs: database.collection('passwordRecoveryLogs')
+    passwordRecoveryLogs: database.collection('passwordRecoveryLogs'),
+    auditLogs: database.collection('auditLogs')
   };
 }
 

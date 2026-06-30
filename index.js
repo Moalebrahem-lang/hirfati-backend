@@ -47,6 +47,28 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json({ limit: '50mb' }));
+const hasNoSqlOperator = value => {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasNoSqlOperator);
+  return Object.entries(value).some(([key, child]) => (
+    key.startsWith('$') || key.includes('.') || hasNoSqlOperator(child)
+  ));
+};
+const hasSuspiciousString = value => {
+  if (typeof value === 'string') return /<\s*script|javascript:|onerror\s*=|onload\s*=/i.test(value);
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasSuspiciousString);
+  return Object.values(value).some(hasSuspiciousString);
+};
+const rejectUnsafeInput = (req, res, next) => {
+  if (hasNoSqlOperator(req.body) || hasNoSqlOperator(req.query) || hasNoSqlOperator(req.params)) {
+    return res.status(400).json({ error: 'المدخلات غير مسموحة.' });
+  }
+  if (hasSuspiciousString(req.body) || hasSuspiciousString(req.query) || hasSuspiciousString(req.params)) {
+    return res.status(400).json({ error: 'المدخلات تحتوي محتوى غير آمن.' });
+  }
+  next();
+};
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.RATE_LIMIT_MAX || 100),
@@ -63,6 +85,7 @@ const authLimiter = rateLimit({
   message: { error: 'محاولات دخول كثيرة. حاول بعد 15 دقيقة.' }
 });
 app.use('/api', apiLimiter);
+app.use('/api', rejectUnsafeInput);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static(path.join(__dirname, '../frontend/build')));
 
@@ -110,8 +133,103 @@ const publicUser = user => {
 };
 const isValidPin = pin => /^\d{4,6}$/.test(String(pin || ''));
 const normalizeRecoveryAnswer = answer => String(answer || '').trim().toLowerCase().replace(/\s+/g, ' ');
+const ipOf = req => String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+
+const safeText = (max = 200) => Joi.string().trim().min(1).max(max);
+const optionalText = (max = 200) => Joi.string().trim().allow('', null).max(max);
+const phoneSchema = Joi.string().trim().min(7).max(24).pattern(/^[+\d\s().-]+$/).required();
+const pinSchema = Joi.string().trim().pattern(/^\d{4,6}$/).required();
+const idSchema = Joi.string().trim().min(2).max(40).pattern(/^[A-Za-z0-9_-]+$/);
+const imageSchema = Joi.string().max(8 * 1024 * 1024);
+const schemas = {
+  passwordRegister: Joi.object({
+    phone: phoneSchema,
+    pin: pinSchema,
+    name: safeText(80).required(),
+    role: Joi.string().valid('client', 'craftsman').default('client'),
+    city: optionalText(60).default('دمشق'),
+    specialty: optionalText(80),
+    recoveryQuestion: safeText(120).required(),
+    recoveryAnswer: safeText(120).required(),
+    recoveryEmail: Joi.string().trim().email().allow('', null).max(160)
+  }),
+  passwordLogin: Joi.object({ phone: phoneSchema, pin: pinSchema }),
+  recoveryStart: Joi.object({ phone: phoneSchema }),
+  recoveryVerify: Joi.object({ phone: phoneSchema, recoveryAnswer: safeText(120).required(), newPin: pinSchema }),
+  otpRequest: Joi.object({ phone: phoneSchema }),
+  otpVerify: Joi.object({ phone: phoneSchema, otp: Joi.string().trim().pattern(/^\d{4}$/).required() }),
+  legacyRegister: Joi.object({
+    registrationToken: Joi.string().trim().min(20).max(2000).required(),
+    name: safeText(80).required(),
+    role: Joi.string().valid('client', 'craftsman').default('client'),
+    city: optionalText(60).default('دمشق'),
+    specialty: optionalText(80)
+  }),
+  profile: Joi.object({
+    name: optionalText(80),
+    city: optionalText(60),
+    bio: optionalText(600),
+    range: Joi.number().integer().min(1).max(300),
+    avatar: optionalText(2 * 1024 * 1024),
+    specialty: optionalText(80)
+  }).min(1),
+  jobCreate: Joi.object({
+    title: safeText(120).required(),
+    desc: safeText(2000).required(),
+    category: safeText(80).required(),
+    city: safeText(60).required(),
+    area: optionalText(100),
+    photos: Joi.array().items(imageSchema).max(5).default([]),
+    budget: Joi.alternatives().try(Joi.number().integer().min(0).max(1000000000), optionalText(60)),
+    schedule: optionalText(80),
+    urgency: Joi.string().valid('normal', 'urgent').default('normal')
+  }),
+  jobStatus: Joi.object({
+    status: Joi.string().valid('open', 'matched', 'done', 'reviewed', 'cancelled').required(),
+    chosenCraftsman: idSchema.allow('', null),
+    cancelReason: optionalText(300)
+  }),
+  interestCreate: Joi.object({
+    jobId: idSchema.required(),
+    note: optionalText(600),
+    estimate: Joi.alternatives().try(Joi.number().integer().min(0).max(1000000000), optionalText(80))
+  }),
+  interestStatus: Joi.object({ status: Joi.string().valid('accepted', 'rejected').required() }),
+  messageCreate: Joi.object({
+    jobId: idSchema.required(),
+    receiverId: idSchema.required(),
+    text: optionalText(2000),
+    image: imageSchema.allow('', null)
+  }).or('text', 'image'),
+  reviewCreate: Joi.object({
+    craftsmanId: idSchema.required(),
+    rating: Joi.number().integer().min(1).max(5).required(),
+    title: safeText(100).required(),
+    text: safeText(1000).required()
+  }),
+  reportCreate: Joi.object({
+    type: Joi.string().valid('user', 'job', 'message', 'review').required(),
+    targetId: idSchema.required(),
+    reason: safeText(400).required()
+  })
+};
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const validateBody = schema => (req, res, next) => {
+  const { value, error } = schema.validate(req.body, {
+    abortEarly: false,
+    stripUnknown: true,
+    convert: true
+  });
+  if (error) return res.status(400).json({ error: 'تحقق من البيانات المدخلة.', details: error.details.map(d => d.message) });
+  req.body = value;
+  next();
+};
+const validateIdParam = (req, res, next) => {
+  const { error } = idSchema.required().validate(req.params.id);
+  if (error) return res.status(400).json({ error: 'المعرّف غير صحيح.' });
+  next();
+};
 
 const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -142,7 +260,22 @@ async function logRecoveryAttempt(phone, result, reason, req) {
     phone,
     result,
     reason: reason || null,
-    ip: req.ip || req.headers['x-forwarded-for'] || null,
+    ip: ipOf(req) || null,
+    userAgent: req.headers['user-agent'] || null,
+    at: Date.now()
+  });
+}
+
+async function logAudit(type, req, details = {}) {
+  await cols().auditLogs.insertOne({
+    id: id('a'),
+    type,
+    userId: req.user?.id || details.userId || null,
+    phone: details.phone || null,
+    result: details.result || null,
+    targetId: details.targetId || null,
+    meta: details.meta || null,
+    ip: ipOf(req) || null,
     userAgent: req.headers['user-agent'] || null,
     at: Date.now()
   });
@@ -177,7 +310,7 @@ app.get('/api/health', asyncRoute(async (req, res) => {
 }));
 
 // --- AUTH ---
-app.post('/api/auth/password/register', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwordRegister), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { pin, name, role, city, specialty, recoveryQuestion, recoveryAnswer, recoveryEmail } = req.body;
 
@@ -222,11 +355,12 @@ app.post('/api/auth/password/register', authLimiter, asyncRoute(async (req, res)
   };
 
   await users.insertOne(user);
+  await logAudit('auth.register', req, { phone, userId: user.id, result: 'success', meta: { role: user.role } });
   const cleanUser = publicUser(user);
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
-app.post('/api/auth/password/login', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/password/login', authLimiter, validateBody(schemas.passwordLogin), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { pin } = req.body;
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -235,25 +369,29 @@ app.post('/api/auth/password/login', authLimiter, asyncRoute(async (req, res) =>
   const user = await cols().users.findOne({ phone });
   if (!user || !user.passwordHash) {
     await recordPasswordFailure(phone);
+    await logAudit('auth.login', req, { phone, result: 'failed', meta: { reason: 'invalid_credentials' } });
     return res.status(401).json({ error: 'رقم الهاتف أو PIN غير صحيح.' });
   }
   if (isPasswordBlocked(user)) {
     const retryAfterSeconds = Math.ceil((user.auth.loginBlockedUntil - Date.now()) / 1000);
+    await logAudit('auth.login', req, { phone, userId: user.id, result: 'blocked', meta: { retryAfterSeconds } });
     return res.status(429).json({ error: 'محاولات كثيرة. حاول لاحقاً.', retryAfterSeconds });
   }
 
   const ok = await bcrypt.compare(String(pin), user.passwordHash);
   if (!ok) {
     await recordPasswordFailure(phone);
+    await logAudit('auth.login', req, { phone, userId: user.id, result: 'failed', meta: { reason: 'wrong_pin' } });
     return res.status(401).json({ error: 'رقم الهاتف أو PIN غير صحيح.' });
   }
 
   await clearPasswordFailures(phone);
+  await logAudit('auth.login', req, { phone, userId: user.id, result: 'success' });
   const cleanUser = publicUser(user);
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
-app.post('/api/auth/password/recovery/start', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/password/recovery/start', authLimiter, validateBody(schemas.recoveryStart), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
@@ -267,7 +405,7 @@ app.post('/api/auth/password/recovery/start', authLimiter, asyncRoute(async (req
   res.json({ recoveryQuestion: user.recoveryQuestion });
 }));
 
-app.post('/api/auth/password/recovery/verify', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/password/recovery/verify', authLimiter, validateBody(schemas.recoveryVerify), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { recoveryAnswer, newPin } = req.body;
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -276,11 +414,13 @@ app.post('/api/auth/password/recovery/verify', authLimiter, asyncRoute(async (re
   const user = await cols().users.findOne({ phone });
   if (!user?.recoveryAnswerHash) {
     await logRecoveryAttempt(phone, 'failed', 'missing_recovery_setup', req);
+    await logAudit('auth.password_recovery', req, { phone, result: 'failed', meta: { reason: 'missing_recovery_setup' } });
     return res.status(404).json({ error: 'لا يمكن استرجاع هذا الحساب حالياً.' });
   }
   if (isPasswordBlocked(user)) {
     await logRecoveryAttempt(phone, 'blocked', 'login_block_active', req);
     const retryAfterSeconds = Math.ceil((user.auth.loginBlockedUntil - Date.now()) / 1000);
+    await logAudit('auth.password_recovery', req, { phone, userId: user.id, result: 'blocked', meta: { retryAfterSeconds } });
     return res.status(429).json({ error: 'محاولات كثيرة. حاول لاحقاً.', retryAfterSeconds });
   }
 
@@ -288,6 +428,7 @@ app.post('/api/auth/password/recovery/verify', authLimiter, asyncRoute(async (re
   if (!ok) {
     await recordPasswordFailure(phone);
     await logRecoveryAttempt(phone, 'failed', 'wrong_recovery_answer', req);
+    await logAudit('auth.password_recovery', req, { phone, userId: user.id, result: 'failed', meta: { reason: 'wrong_recovery_answer' } });
     return res.status(401).json({ error: 'إجابة الاسترجاع غير صحيحة.' });
   }
 
@@ -305,12 +446,13 @@ app.post('/api/auth/password/recovery/verify', authLimiter, asyncRoute(async (re
     }
   );
   await logRecoveryAttempt(phone, 'success', 'pin_reset', req);
+  await logAudit('auth.password_recovery', req, { phone, userId: user.id, result: 'success' });
 
   const updated = publicUser(await cols().users.findOne({ phone }));
   res.json({ token: signAuthToken(updated), user: updated });
 }));
 
-app.post('/api/auth/otp', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
@@ -356,7 +498,7 @@ app.post('/api/auth/otp', authLimiter, asyncRoute(async (req, res) => {
   res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.' });
 }));
 
-app.post('/api/auth/verify-otp', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/verify-otp', authLimiter, validateBody(schemas.otpVerify), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { otp } = req.body;
   const submittedOtp = String(otp || '').replace(/\D/g, '');
@@ -390,7 +532,7 @@ app.post('/api/auth/verify-otp', authLimiter, asyncRoute(async (req, res) => {
   res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true, registrationToken });
 }));
 
-app.post('/api/auth/register', authLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/register', authLimiter, validateBody(schemas.legacyRegister), asyncRoute(async (req, res) => {
   const { registrationToken, name, role, city, specialty } = req.body;
   if (!registrationToken) return res.status(400).json({ error: 'جلسة التسجيل غير صالحة.' });
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'أدخل الاسم.' });
@@ -444,7 +586,7 @@ app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
   res.json(publicUser(user));
 }));
 
-app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
+app.put('/api/users/profile', authenticate, validateBody(schemas.profile), asyncRoute(async (req, res) => {
   const { name, city, bio, range, avatar, specialty } = req.body;
   const current = await cols().users.findOne({ id: req.user.id });
   if (!current) return res.status(404).json({ error: 'غير موجود.' });
@@ -462,6 +604,11 @@ app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
       }
     }
   );
+  await logAudit('user.profile_update', req, {
+    userId: req.user.id,
+    result: 'success',
+    meta: { fields: Object.keys(req.body) }
+  });
   res.json({ success: true });
 }));
 
@@ -476,7 +623,7 @@ app.get('/api/jobs', authenticate, asyncRoute(async (req, res) => {
   res.json(normalizeMany(jobs));
 }));
 
-app.post('/api/jobs', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/jobs', authenticate, validateBody(schemas.jobCreate), asyncRoute(async (req, res) => {
   const { title, desc, category, city, area, photos, budget, schedule, urgency } = req.body;
   const job = {
     id: id('j'),
@@ -500,7 +647,7 @@ app.post('/api/jobs', authenticate, asyncRoute(async (req, res) => {
   res.json({ id: job.id });
 }));
 
-app.put('/api/jobs/:id/status', authenticate, asyncRoute(async (req, res) => {
+app.put('/api/jobs/:id/status', authenticate, validateIdParam, validateBody(schemas.jobStatus), asyncRoute(async (req, res) => {
   const { status, chosenCraftsman, cancelReason } = req.body;
   await cols().jobs.updateOne(
     { id: req.params.id },
@@ -519,7 +666,7 @@ app.get('/api/interests', authenticate, asyncRoute(async (req, res) => {
   res.json(normalizeMany(interests));
 }));
 
-app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), asyncRoute(async (req, res) => {
   const { jobId, note, estimate } = req.body;
   const interest = {
     id: id('i'),
@@ -540,7 +687,7 @@ app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
   res.json({ id: interest.id });
 }));
 
-app.put('/api/interests/:id/status', authenticate, asyncRoute(async (req, res) => {
+app.put('/api/interests/:id/status', authenticate, validateIdParam, validateBody(schemas.interestStatus), asyncRoute(async (req, res) => {
   const { status } = req.body;
   if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'حالة العرض غير صحيحة.' });
 
@@ -580,7 +727,7 @@ app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
   res.json(normalizeMany(messages));
 }));
 
-app.post('/api/messages', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/messages', authenticate, validateBody(schemas.messageCreate), asyncRoute(async (req, res) => {
   const { jobId, receiverId, text, image } = req.body;
   if (!text && !image) return res.status(400).json({ error: 'اكتب رسالة أو أرسل صورة.' });
   const message = {
@@ -618,7 +765,7 @@ app.get('/api/reviews', authenticate, asyncRoute(async (req, res) => {
   res.json(normalizeMany(reviews));
 }));
 
-app.post('/api/reviews', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/reviews', authenticate, validateBody(schemas.reviewCreate), asyncRoute(async (req, res) => {
   const { craftsmanId, rating, title, text } = req.body;
   const client = await cols().users.findOne({ id: req.user.id }, { projection: { name: 1, city: 1 } });
   const review = {
@@ -647,7 +794,7 @@ app.post('/api/reviews', authenticate, asyncRoute(async (req, res) => {
 }));
 
 // --- REPORTS ---
-app.post('/api/reports', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/reports', authenticate, validateBody(schemas.reportCreate), asyncRoute(async (req, res) => {
   const { type, targetId, reason } = req.body;
   const report = {
     id: id('rep'),
