@@ -30,12 +30,16 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || 
   .filter(Boolean);
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
 const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
+const ENABLE_OTP_AUTH = process.env.ENABLE_OTP_AUTH === 'true';
 const PASSWORD_LOCK_MS = Number(process.env.PASSWORD_LOCK_MS || 15 * 60 * 1000);
 const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTEMPTS || 5);
 const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '20m';
 const REFRESH_TOKEN_DAYS = Number(process.env.REFRESH_TOKEN_DAYS || 7);
 const ENCRYPTION_KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || SECRET).digest();
+if (process.env.NODE_ENV === 'production' && SECRET === 'hirfati-secret-key-2024') {
+  throw new Error('JWT_SECRET must be set to a strong secret in production.');
+}
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -87,6 +91,10 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: false,
   message: { error: 'محاولات دخول كثيرة. حاول بعد 15 دقيقة.' }
 });
+const requireOtpEnabled = (req, res, next) => {
+  if (!ENABLE_OTP_AUTH) return res.status(410).json({ error: 'تسجيل الدخول عبر OTP غير مفعّل حالياً.' });
+  next();
+};
 app.use('/api', apiLimiter);
 app.use('/api', rejectUnsafeInput);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -504,7 +512,7 @@ app.post('/api/auth/password/recovery/verify', authLimiter, validateBody(schemas
   res.json(await authPayload(updated, req));
 }));
 
-app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
+app.post('/api/auth/otp', authLimiter, requireOtpEnabled, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
@@ -550,7 +558,7 @@ app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRo
   res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.' });
 }));
 
-app.post('/api/auth/verify-otp', authLimiter, validateBody(schemas.otpVerify), asyncRoute(async (req, res) => {
+app.post('/api/auth/verify-otp', authLimiter, requireOtpEnabled, validateBody(schemas.otpVerify), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { otp } = req.body;
   const submittedOtp = String(otp || '').replace(/\D/g, '');
@@ -583,7 +591,7 @@ app.post('/api/auth/verify-otp', authLimiter, validateBody(schemas.otpVerify), a
   res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true, registrationToken });
 }));
 
-app.post('/api/auth/register', authLimiter, validateBody(schemas.legacyRegister), asyncRoute(async (req, res) => {
+app.post('/api/auth/register', authLimiter, requireOtpEnabled, validateBody(schemas.legacyRegister), asyncRoute(async (req, res) => {
   const { registrationToken, name, role, city, specialty } = req.body;
   if (!registrationToken) return res.status(400).json({ error: 'جلسة التسجيل غير صالحة.' });
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'أدخل الاسم.' });
@@ -626,10 +634,10 @@ app.post('/api/auth/register', authLimiter, validateBody(schemas.legacyRegister)
 }));
 
 app.post('/api/auth/login', authLimiter, (req, res) => {
-  res.status(410).json({ error: 'استخدم /api/auth/verify-otp للتحقق من رمز الدخول.' });
+  res.status(410).json({ error: 'استخدم تسجيل الدخول بالـ PIN.' });
 });
 
-app.post('/api/auth/refresh', validateBody(schemas.refresh), asyncRoute(async (req, res) => {
+app.post('/api/auth/refresh', authLimiter, validateBody(schemas.refresh), asyncRoute(async (req, res) => {
   const tokenHash = hashRefreshToken(req.body.refreshToken);
   const stored = await cols().refreshTokens.findOne({ tokenHash, revokedAt: null });
   if (!stored || stored.expiresAt < new Date()) {
@@ -649,7 +657,7 @@ app.post('/api/auth/refresh', validateBody(schemas.refresh), asyncRoute(async (r
   res.json(await authPayload(user, req));
 }));
 
-app.post('/api/auth/logout', validateBody(schemas.logout), asyncRoute(async (req, res) => {
+app.post('/api/auth/logout', authLimiter, validateBody(schemas.logout), asyncRoute(async (req, res) => {
   if (req.body.refreshToken) {
     await cols().refreshTokens.updateOne(
       { tokenHash: hashRefreshToken(req.body.refreshToken) },
@@ -730,12 +738,23 @@ app.post('/api/jobs', authenticate, validateBody(schemas.jobCreate), asyncRoute(
 
 app.put('/api/jobs/:id/status', authenticate, validateIdParam, validateBody(schemas.jobStatus), asyncRoute(async (req, res) => {
   const { status, chosenCraftsman, cancelReason } = req.body;
+  const job = await cols().jobs.findOne({ id: req.params.id });
+  if (!job) return res.status(404).json({ error: 'غير موجود.' });
+
+  const isOwner = job.clientId === req.user.id;
+  const isAdmin = req.user.role === 'admin';
+  const isChosenCraftsman = job.chosenCraftsman && job.chosenCraftsman === req.user.id;
+  if (!isOwner && !isAdmin && !(isChosenCraftsman && status === 'done')) {
+    return res.status(403).json({ error: 'غير مسموح بتعديل هذا الطلب.' });
+  }
+  if (chosenCraftsman && !isOwner && !isAdmin) {
+    return res.status(403).json({ error: 'اختيار الحرفي متاح لصاحب الطلب فقط.' });
+  }
+
   await cols().jobs.updateOne(
     { id: req.params.id },
     { $set: { status, chosenCraftsman: chosenCraftsman || null, cancelReason: cancelReason || null } }
   );
-  const job = await cols().jobs.findOne({ id: req.params.id });
-  if (!job) return res.status(404).json({ error: 'غير موجود.' });
   if (status === 'matched' && chosenCraftsman) await addNotif(chosenCraftsman, 'match', `بدأ العميل المحادثة معك: ${job.title.slice(0, 30)}`, job.id);
   if (status === 'cancelled' && job.chosenCraftsman) await addNotif(job.chosenCraftsman, 'cancel', `تم إلغاء الطلب: ${job.title.slice(0, 30)}`, job.id);
   res.json({ success: true });
@@ -749,6 +768,12 @@ app.get('/api/interests', authenticate, asyncRoute(async (req, res) => {
 
 app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), asyncRoute(async (req, res) => {
   const { jobId, note, estimate } = req.body;
+  if (req.user.role !== 'craftsman' && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'إرسال العروض متاح للحرفيين فقط.' });
+  }
+  const job = await cols().jobs.findOne({ id: jobId });
+  if (!job) return res.status(404).json({ error: 'الطلب غير موجود.' });
+  if (job.clientId === req.user.id) return res.status(403).json({ error: 'لا يمكنك إرسال عرض على طلبك.' });
   const interest = {
     id: id('i'),
     jobId,
@@ -760,8 +785,8 @@ app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), a
   };
   await cols().interests.insertOne(interest);
 
-  const [job, craftsman] = await Promise.all([
-    cols().jobs.findOne({ id: jobId }),
+  const [, craftsman] = await Promise.all([
+    Promise.resolve(job),
     cols().users.findOne({ id: req.user.id }, { projection: { name: 1 } })
   ]);
   if (job) await addNotif(job.clientId, 'interest', `${craftsman?.name || 'حرفي'} مهتم بطلبك: ${job.title.slice(0, 30)}`, jobId);
@@ -811,6 +836,12 @@ app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
 app.post('/api/messages', authenticate, validateBody(schemas.messageCreate), asyncRoute(async (req, res) => {
   const { jobId, receiverId, text, image } = req.body;
   if (!text && !image) return res.status(400).json({ error: 'اكتب رسالة أو أرسل صورة.' });
+  const job = await cols().jobs.findOne({ id: jobId });
+  if (!job) return res.status(404).json({ error: 'الطلب غير موجود.' });
+  const allowedParticipants = new Set([job.clientId, job.chosenCraftsman].filter(Boolean));
+  if (!allowedParticipants.has(req.user.id) || !allowedParticipants.has(receiverId)) {
+    return res.status(403).json({ error: 'غير مسموح بإرسال رسالة على هذا الطلب.' });
+  }
   const message = {
     id: id('m'),
     jobId,
@@ -848,6 +879,15 @@ app.get('/api/reviews', authenticate, asyncRoute(async (req, res) => {
 
 app.post('/api/reviews', authenticate, validateBody(schemas.reviewCreate), asyncRoute(async (req, res) => {
   const { craftsmanId, rating, title, text } = req.body;
+  if (req.user.id === craftsmanId) return res.status(403).json({ error: 'لا يمكنك تقييم حسابك.' });
+  const completedJob = await cols().jobs.findOne({
+    clientId: req.user.id,
+    chosenCraftsman: craftsmanId,
+    status: { $in: ['done', 'reviewed'] }
+  });
+  if (!completedJob && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'يمكن التقييم بعد إنهاء عمل حقيقي فقط.' });
+  }
   const client = await cols().users.findOne({ id: req.user.id }, { projection: { name: 1, city: 1 } });
   const review = {
     id: id('r'),
@@ -907,6 +947,9 @@ app.get('*', (req, res) => {
 });
 
 app.use((err, req, res, next) => {
+  if (err.message === 'CORS origin is not allowed.') {
+    return res.status(403).json({ error: 'المصدر غير مسموح.' });
+  }
   console.error(err);
   res.status(500).json({ error: 'حدث خطأ في الخادم.' });
 });
