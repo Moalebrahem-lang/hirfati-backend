@@ -5,6 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -18,6 +19,9 @@ const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const API_ORIGIN = process.env.CORS_ORIGIN || '*';
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
 const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
+const PASSWORD_LOCK_MS = Number(process.env.PASSWORD_LOCK_MS || 15 * 60 * 1000);
+const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTEMPTS || 5);
+const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -71,6 +75,8 @@ const hashOtp = (phone, otp) => crypto
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
   .digest('hex');
 const signAuthToken = user => jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
+const isValidPin = pin => /^\d{4,6}$/.test(String(pin || ''));
+const normalizeRecoveryAnswer = answer => String(answer || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -97,12 +103,180 @@ async function addNotif(userId, type, text, jobId) {
   });
 }
 
+async function logRecoveryAttempt(phone, result, reason, req) {
+  await cols().passwordRecoveryLogs.insertOne({
+    id: id('pr'),
+    phone,
+    result,
+    reason: reason || null,
+    ip: req.ip || req.headers['x-forwarded-for'] || null,
+    userAgent: req.headers['user-agent'] || null,
+    at: Date.now()
+  });
+}
+
+function isPasswordBlocked(user) {
+  const blockedUntil = user?.auth?.loginBlockedUntil || 0;
+  return blockedUntil && blockedUntil > Date.now();
+}
+
+async function recordPasswordFailure(phone) {
+  const user = await cols().users.findOne({ phone });
+  if (!user) return;
+  const count = (user.auth?.failedLoginCount || 0) + 1;
+  const update = { 'auth.failedLoginCount': count, 'auth.lastFailedLoginAt': Date.now() };
+  if (count >= PASSWORD_MAX_FAILED_ATTEMPTS) {
+    update['auth.loginBlockedUntil'] = Date.now() + PASSWORD_LOCK_MS;
+  }
+  await cols().users.updateOne({ phone }, { $set: update });
+}
+
+async function clearPasswordFailures(phone) {
+  await cols().users.updateOne(
+    { phone },
+    { $set: { 'auth.failedLoginCount': 0, 'auth.loginBlockedUntil': 0, 'auth.lastLoginAt': Date.now() } }
+  );
+}
+
 app.get('/api/health', asyncRoute(async (req, res) => {
   const status = await healthCheck();
   res.status(status.ok ? 200 : 503).json(status);
 }));
 
 // --- AUTH ---
+app.post('/api/auth/password/register', asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const { pin, name, role, city, specialty, recoveryQuestion, recoveryAnswer, recoveryEmail } = req.body;
+
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+  if (!isValidPin(pin)) return res.status(400).json({ error: 'اختر PIN من 4 إلى 6 أرقام.' });
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'أدخل الاسم.' });
+  if (!recoveryQuestion || !String(recoveryQuestion).trim()) return res.status(400).json({ error: 'اختر سؤال أمان.' });
+  if (!recoveryAnswer || normalizeRecoveryAnswer(recoveryAnswer).length < 2) return res.status(400).json({ error: 'أدخل إجابة أمان واضحة.' });
+
+  const { users } = cols();
+  const existing = await users.findOne({ phone });
+  if (existing?.passwordHash) return res.status(409).json({ error: 'هذا الرقم مسجل مسبقاً. سجّل الدخول بالـ PIN.' });
+  if (existing && !existing.passwordHash) {
+    return res.status(409).json({ error: 'هذا الحساب موجود ويحتاج تفعيل كلمة مرور من الإدارة.' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(pin), PASSWORD_BCRYPT_ROUNDS);
+  const recoveryAnswerHash = await bcrypt.hash(normalizeRecoveryAnswer(recoveryAnswer), PASSWORD_BCRYPT_ROUNDS);
+  const cleanName = String(name).trim();
+  const user = {
+    id: id('u'),
+    name: cleanName,
+    phone,
+    role: role || 'client',
+    city: city || 'دمشق',
+    avatar: cleanName.slice(0, 2),
+    specialty: role === 'craftsman' ? (specialty || null) : null,
+    rating: 0,
+    reviewsCount: 0,
+    bio: '',
+    verified: 0,
+    warranty: 0,
+    jobsDone: 0,
+    range: 25,
+    saved: [],
+    passwordHash,
+    passwordSetAt: Date.now(),
+    recoveryQuestion: String(recoveryQuestion).trim(),
+    recoveryAnswerHash,
+    recoveryEmail: recoveryEmail ? String(recoveryEmail).trim().toLowerCase() : null,
+    auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
+  };
+
+  await users.insertOne(user);
+  const cleanUser = stripMongoId(user);
+  res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+}));
+
+app.post('/api/auth/password/login', asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const { pin } = req.body;
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+  if (!isValidPin(pin)) return res.status(400).json({ error: 'PIN غير صحيح.' });
+
+  const user = await cols().users.findOne({ phone });
+  if (!user || !user.passwordHash) {
+    await recordPasswordFailure(phone);
+    return res.status(401).json({ error: 'رقم الهاتف أو PIN غير صحيح.' });
+  }
+  if (isPasswordBlocked(user)) {
+    const retryAfterSeconds = Math.ceil((user.auth.loginBlockedUntil - Date.now()) / 1000);
+    return res.status(429).json({ error: 'محاولات كثيرة. حاول لاحقاً.', retryAfterSeconds });
+  }
+
+  const ok = await bcrypt.compare(String(pin), user.passwordHash);
+  if (!ok) {
+    await recordPasswordFailure(phone);
+    return res.status(401).json({ error: 'رقم الهاتف أو PIN غير صحيح.' });
+  }
+
+  await clearPasswordFailures(phone);
+  const cleanUser = stripMongoId(user);
+  res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+}));
+
+app.post('/api/auth/password/recovery/start', asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+
+  const user = await cols().users.findOne({ phone });
+  if (!user?.recoveryQuestion || !user?.recoveryAnswerHash) {
+    await logRecoveryAttempt(phone, 'failed', 'missing_recovery_question', req);
+    return res.status(404).json({ error: 'لا يوجد سؤال استرجاع لهذا الحساب.' });
+  }
+
+  await logRecoveryAttempt(phone, 'started', 'question_returned', req);
+  res.json({ recoveryQuestion: user.recoveryQuestion });
+}));
+
+app.post('/api/auth/password/recovery/verify', asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const { recoveryAnswer, newPin } = req.body;
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+  if (!isValidPin(newPin)) return res.status(400).json({ error: 'اختر PIN جديد من 4 إلى 6 أرقام.' });
+
+  const user = await cols().users.findOne({ phone });
+  if (!user?.recoveryAnswerHash) {
+    await logRecoveryAttempt(phone, 'failed', 'missing_recovery_setup', req);
+    return res.status(404).json({ error: 'لا يمكن استرجاع هذا الحساب حالياً.' });
+  }
+  if (isPasswordBlocked(user)) {
+    await logRecoveryAttempt(phone, 'blocked', 'login_block_active', req);
+    const retryAfterSeconds = Math.ceil((user.auth.loginBlockedUntil - Date.now()) / 1000);
+    return res.status(429).json({ error: 'محاولات كثيرة. حاول لاحقاً.', retryAfterSeconds });
+  }
+
+  const ok = await bcrypt.compare(normalizeRecoveryAnswer(recoveryAnswer), user.recoveryAnswerHash);
+  if (!ok) {
+    await recordPasswordFailure(phone);
+    await logRecoveryAttempt(phone, 'failed', 'wrong_recovery_answer', req);
+    return res.status(401).json({ error: 'إجابة الاسترجاع غير صحيحة.' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(newPin), PASSWORD_BCRYPT_ROUNDS);
+  await cols().users.updateOne(
+    { phone },
+    {
+      $set: {
+        passwordHash,
+        passwordSetAt: Date.now(),
+        'auth.failedLoginCount': 0,
+        'auth.loginBlockedUntil': 0,
+        'auth.passwordRecoveredAt': Date.now()
+      }
+    }
+  );
+  await logRecoveryAttempt(phone, 'success', 'pin_reset', req);
+
+  const updated = stripMongoId(await cols().users.findOne({ phone }));
+  res.json({ token: signAuthToken(updated), user: updated });
+}));
+
 app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
