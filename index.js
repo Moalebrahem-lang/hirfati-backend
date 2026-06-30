@@ -2,6 +2,8 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
@@ -13,8 +15,20 @@ const PORT = process.env.PORT || 5000;
 const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const API_ORIGIN = process.env.CORS_ORIGIN || '*';
 
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
 app.use(cors({ origin: API_ORIGIN }));
 app.use(express.json({ limit: '50mb' }));
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX || 300),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'طلبات كثيرة. حاول لاحقاً.' }
+}));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static(path.join(__dirname, '../frontend/build')));
 
@@ -32,7 +46,14 @@ const storage = multer.diskStorage({
     cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(file.originalname)}`);
   }
 });
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) return cb(new Error('يسمح برفع الصور فقط.'));
+    cb(null, true);
+  }
+});
 
 const id = prefix => prefix + Math.random().toString(36).slice(2, 10);
 
@@ -40,12 +61,12 @@ const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next))
 
 const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
+  if (!token) return res.status(401).json({ error: 'يرجى تسجيل الدخول.' });
   try {
     req.user = jwt.verify(token, SECRET);
     next();
   } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
   }
 };
 
@@ -71,18 +92,18 @@ app.get('/api/health', asyncRoute(async (req, res) => {
 // --- AUTH ---
 app.post('/api/auth/otp', (req, res) => {
   const { phone } = req.body;
-  if (!phone || phone.length < 9) return res.status(400).json({ error: 'Invalid phone' });
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
   res.json({ message: 'OTP sent' });
 });
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const { phone, otp, name, role, city, specialty } = req.body;
-  if (otp !== '1234') return res.status(400).json({ error: 'Invalid OTP' });
+  if (otp !== '1234') return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
 
   const { users } = cols();
   let user = await users.findOne({ phone });
   if (!user) {
-    if (!name) return res.status(404).json({ error: 'User not found', needsRegistration: true });
+    if (!name) return res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true });
     const newUser = {
       id: id('u'),
       name,
@@ -112,14 +133,14 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
 // --- USERS ---
 app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
   const user = await cols().users.findOne({ id: req.user.id });
-  if (!user) return res.status(404).json({ error: 'Not found' });
+  if (!user) return res.status(404).json({ error: 'غير موجود.' });
   res.json(stripMongoId(user));
 }));
 
 app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
   const { name, city, bio, range, avatar, specialty } = req.body;
   const current = await cols().users.findOne({ id: req.user.id });
-  if (!current) return res.status(404).json({ error: 'Not found' });
+  if (!current) return res.status(404).json({ error: 'غير موجود.' });
 
   await cols().users.updateOne(
     { id: req.user.id },
@@ -179,7 +200,7 @@ app.put('/api/jobs/:id/status', authenticate, asyncRoute(async (req, res) => {
     { $set: { status, chosenCraftsman: chosenCraftsman || null, cancelReason: cancelReason || null } }
   );
   const job = await cols().jobs.findOne({ id: req.params.id });
-  if (!job) return res.status(404).json({ error: 'Not found' });
+  if (!job) return res.status(404).json({ error: 'غير موجود.' });
   if (status === 'matched' && chosenCraftsman) await addNotif(chosenCraftsman, 'match', `بدأ العميل المحادثة معك: ${job.title.slice(0, 30)}`, job.id);
   if (status === 'cancelled' && job.chosenCraftsman) await addNotif(job.chosenCraftsman, 'cancel', `تم إلغاء الطلب: ${job.title.slice(0, 30)}`, job.id);
   res.json({ success: true });
@@ -214,14 +235,14 @@ app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
 
 app.put('/api/interests/:id/status', authenticate, asyncRoute(async (req, res) => {
   const { status } = req.body;
-  if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'حالة العرض غير صحيحة.' });
 
   const interest = await cols().interests.findOne({ id: req.params.id });
-  if (!interest) return res.status(404).json({ error: 'Not found' });
+  if (!interest) return res.status(404).json({ error: 'غير موجود.' });
 
   const job = await cols().jobs.findOne({ id: interest.jobId });
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  if (job.clientId !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  if (!job) return res.status(404).json({ error: 'الطلب غير موجود.' });
+  if (job.clientId !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
 
   await cols().interests.updateOne({ id: interest.id }, { $set: { status } });
 
@@ -254,7 +275,7 @@ app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
 
 app.post('/api/messages', authenticate, asyncRoute(async (req, res) => {
   const { jobId, receiverId, text, image } = req.body;
-  if (!text && !image) return res.status(400).json({ error: 'Message text or image is required' });
+  if (!text && !image) return res.status(400).json({ error: 'اكتب رسالة أو أرسل صورة.' });
   const message = {
     id: id('m'),
     jobId,
@@ -334,7 +355,7 @@ app.post('/api/reports', authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/reports', authenticate, asyncRoute(async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
   const reports = await cols().reports.find({}).sort({ at: -1 }).toArray();
   res.json(normalizeMany(reports));
 }));
@@ -347,12 +368,12 @@ app.post('/api/upload', authenticate, upload.array('photos', 5), (req, res) => {
 app.get('*', (req, res) => {
   const idx = path.join(__dirname, '../frontend/build/index.html');
   if (fs.existsSync(idx)) res.sendFile(idx);
-  else res.status(404).json({ error: 'Not found' });
+  else res.status(404).json({ error: 'غير موجود.' });
 });
 
 app.use((err, req, res, next) => {
   console.error(err);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ error: 'حدث خطأ في الخادم.' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
