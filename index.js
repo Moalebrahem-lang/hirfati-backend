@@ -9,7 +9,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { connect, cols, stripMongoId, normalizeMany, isConnected, connectionError } = require('./db');
+const { connect, cols, stripMongoId, normalizeMany, healthCheck } = require('./db');
 const { sendOtp } = require('./sms');
 
 const app = express();
@@ -93,10 +93,8 @@ async function addNotif(userId, type, text, jobId) {
 }
 
 app.get('/api/health', asyncRoute(async (req, res) => {
-  if (!isConnected()) {
-    return res.status(503).json({ ok: false, db: 'mongodb', error: connectionError(), at: Date.now() });
-  }
-  res.json({ ok: true, db: 'mongodb', at: Date.now() });
+  const status = await healthCheck();
+  res.status(status.ok ? 200 : 503).json(status);
 }));
 
 // --- AUTH ---

@@ -12,7 +12,9 @@ if (!MONGODB_URI) {
 const client = new MongoClient(MONGODB_URI, {
   maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 50),
   minPoolSize: Number(process.env.MONGODB_MIN_POOL_SIZE || 2),
-  retryWrites: true
+  retryWrites: true,
+  tls: true,
+  tlsAllowInvalidCertificates: false
 });
 
 let database;
@@ -160,6 +162,18 @@ function isConnected() {
   return Boolean(database);
 }
 
+async function healthCheck() {
+  try {
+    const db = database || await connect();
+    await db.command({ ping: 1 });
+    lastError = null;
+    return { ok: true, db: 'mongodb', at: Date.now() };
+  } catch (err) {
+    lastError = err;
+    return { ok: false, db: 'mongodb', error: err.message, at: Date.now() };
+  }
+}
+
 function connectionError() {
   return lastError?.message || null;
 }
@@ -184,5 +198,6 @@ module.exports = {
   stripMongoId,
   normalizeMany,
   isConnected,
+  healthCheck,
   connectionError
 };
