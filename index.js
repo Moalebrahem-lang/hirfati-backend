@@ -8,12 +8,16 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { connect, cols, stripMongoId, normalizeMany, isConnected, connectionError } = require('./db');
+const { sendOtpSms } = require('./sms');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const API_ORIGIN = process.env.CORS_ORIGIN || '*';
+const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
+const DEMO_OTP_ENABLED = process.env.DEMO_OTP_ENABLED === 'true';
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -56,6 +60,12 @@ const upload = multer({
 });
 
 const id = prefix => prefix + Math.random().toString(36).slice(2, 10);
+const normalizePhone = phone => String(phone || '').replace(/\D/g, '');
+const createOtp = () => String(crypto.randomInt(1000, 10000));
+const hashOtp = (phone, otp) => crypto
+  .createHash('sha256')
+  .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
+  .digest('hex');
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -90,15 +100,63 @@ app.get('/api/health', asyncRoute(async (req, res) => {
 }));
 
 // --- AUTH ---
-app.post('/api/auth/otp', (req, res) => {
-  const { phone } = req.body;
+app.post('/api/auth/otp', asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
-  res.json({ message: 'OTP sent' });
-});
+
+  const otp = createOtp();
+  await cols().otps.updateOne(
+    { phone, purpose: 'login' },
+    {
+      $set: {
+        phone,
+        purpose: 'login',
+        hash: hashOtp(phone, otp),
+        attempts: 0,
+        expiresAt: new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000),
+        createdAt: new Date()
+      }
+    },
+    { upsert: true }
+  );
+
+  try {
+    await sendOtpSms(phone, otp);
+  } catch (err) {
+    await cols().otps.deleteOne({ phone, purpose: 'login' });
+    console.error('Twilio OTP failed:', err.message);
+    return res.status(503).json({
+      error: 'تعذر إرسال رمز التحقق حالياً. تحقق من إعدادات خدمة الرسائل.'
+    });
+  }
+
+  res.json({ message: 'تم إرسال رمز التحقق.' });
+}));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
-  const { phone, otp, name, role, city, specialty } = req.body;
-  if (otp !== '1234') return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
+  const phone = normalizePhone(req.body.phone);
+  const { otp, name, role, city, specialty } = req.body;
+  const submittedOtp = String(otp || '').replace(/\D/g, '');
+
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+  if (!submittedOtp || submittedOtp.length !== 4) return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
+
+  const demoOtpAllowed = DEMO_OTP_ENABLED && submittedOtp === '1234' && ['0991112233', '0944556677', '0900000000'].includes(phone);
+  if (!demoOtpAllowed) {
+    const otpRecord = await cols().otps.findOne({ phone, purpose: 'login' });
+    if (!otpRecord || otpRecord.expiresAt < new Date()) {
+      return res.status(400).json({ error: 'انتهت صلاحية رمز التحقق. اطلب رمزاً جديداً.' });
+    }
+    if (otpRecord.attempts >= 5) {
+      await cols().otps.deleteOne({ phone, purpose: 'login' });
+      return res.status(429).json({ error: 'محاولات كثيرة. اطلب رمزاً جديداً.' });
+    }
+    if (otpRecord.hash !== hashOtp(phone, submittedOtp)) {
+      await cols().otps.updateOne({ phone, purpose: 'login' }, { $inc: { attempts: 1 } });
+      return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
+    }
+    await cols().otps.deleteOne({ phone, purpose: 'login' });
+  }
 
   const { users } = cols();
   let user = await users.findOne({ phone });
