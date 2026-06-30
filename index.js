@@ -10,7 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { connect, cols, stripMongoId, normalizeMany, isConnected, connectionError } = require('./db');
-const { sendOtpSms } = require('./sms');
+const { sendOtp } = require('./sms');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -121,12 +121,12 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   );
 
   try {
-    await sendOtpSms(phone, otp);
+    await sendOtp(phone, otp);
   } catch (err) {
     await cols().otps.deleteOne({ phone, purpose: 'login' });
-    console.error('Twilio OTP failed:', err.message);
+    console.error('Twilio WhatsApp OTP failed:', err.message);
     return res.status(503).json({
-      error: 'تعذر إرسال رمز التحقق حالياً. تحقق من إعدادات خدمة الرسائل.'
+      error: 'تعذر إرسال رمز التحقق عبر واتساب حالياً. تحقق من إعدادات الخدمة.'
     });
   }
 
