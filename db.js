@@ -16,6 +16,7 @@ const client = new MongoClient(MONGODB_URI, {
 });
 
 let database;
+let lastError = null;
 
 const demoUsers = [
   {
@@ -140,11 +141,25 @@ async function seedDemoUsers(db) {
 
 async function connect() {
   if (database) return database;
-  await client.connect();
-  database = client.db(DB_NAME);
-  await createIndexes(database);
-  await seedDemoUsers(database);
-  return database;
+  try {
+    await client.connect();
+    database = client.db(DB_NAME);
+    await createIndexes(database);
+    await seedDemoUsers(database);
+    lastError = null;
+    return database;
+  } catch (err) {
+    lastError = err;
+    throw err;
+  }
+}
+
+function isConnected() {
+  return Boolean(database);
+}
+
+function connectionError() {
+  return lastError?.message || null;
 }
 
 function cols() {
@@ -164,5 +179,7 @@ module.exports = {
   connect,
   cols,
   stripMongoId,
-  normalizeMany
+  normalizeMany,
+  isConnected,
+  connectionError
 };

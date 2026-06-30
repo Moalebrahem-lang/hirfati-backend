@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { connect, cols, stripMongoId, normalizeMany } = require('./db');
+const { connect, cols, stripMongoId, normalizeMany, isConnected, connectionError } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -62,7 +62,9 @@ async function addNotif(userId, type, text, jobId) {
 }
 
 app.get('/api/health', asyncRoute(async (req, res) => {
-  await connect();
+  if (!isConnected()) {
+    return res.status(503).json({ ok: false, db: 'mongodb', error: connectionError(), at: Date.now() });
+  }
   res.json({ ok: true, db: 'mongodb', at: Date.now() });
 }));
 
@@ -353,11 +355,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-connect()
-  .then(() => {
-    app.listen(PORT, '0.0.0.0', () => console.log(`🚀 حِرفتي running on port ${PORT} with MongoDB`));
-  })
-  .catch(err => {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  });
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 حِرفتي running on port ${PORT}`);
+  connect()
+    .then(() => console.log('✅ MongoDB connected'))
+    .catch(err => console.error('MongoDB connection failed:', err.message));
+});
