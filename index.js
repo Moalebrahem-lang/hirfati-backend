@@ -62,6 +62,7 @@ const upload = multer({
 const id = prefix => prefix + Math.random().toString(36).slice(2, 10);
 const normalizePhone = phone => String(phone || '').replace(/\D/g, '');
 const createOtp = () => String(crypto.randomInt(1000, 10000));
+const isDemoPhone = phone => DEMO_PHONES.includes(normalizePhone(phone));
 const hashOtp = (phone, otp) => crypto
   .createHash('sha256')
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
@@ -102,6 +103,14 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
+  if (isDemoPhone(phone)) {
+    return res.json({
+      message: 'استخدم رمز التحقق التجريبي.',
+      devOtp: '1234',
+      whatsappSent: false
+    });
+  }
+
   const otp = createOtp();
   await cols().otps.updateOne(
     { phone, purpose: 'login' },
@@ -134,7 +143,11 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
     });
   }
 
-  res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.', whatsappSent: true });
+  res.json({
+    message: 'تم إرسال رمز التحقق عبر واتساب. رمز التطوير ظاهر مؤقتاً للتجربة.',
+    devOtp: otp,
+    whatsappSent: true
+  });
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
@@ -145,7 +158,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
   if (!submittedOtp || submittedOtp.length !== 4) return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
 
-  const demoOtpAllowed = submittedOtp === '1234' && DEMO_PHONES.includes(phone);
+  const demoOtpAllowed = submittedOtp === '1234' && isDemoPhone(phone);
   if (!demoOtpAllowed) {
     const otpRecord = await cols().otps.findOne({ phone, purpose: 'login' });
     if (!otpRecord || otpRecord.expiresAt < new Date()) {
