@@ -172,7 +172,6 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
       await cols().otps.updateOne({ phone, purpose: 'login' }, { $inc: { attempts: 1 } });
       return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
     }
-    await cols().otps.deleteOne({ phone, purpose: 'login' });
   }
 
   const { users } = cols();
@@ -198,6 +197,10 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     };
     await users.insertOne(newUser);
     user = newUser;
+  }
+
+  if (!demoOtpAllowed) {
+    await cols().otps.deleteOne({ phone, purpose: 'login' });
   }
 
   user = stripMongoId(user);
