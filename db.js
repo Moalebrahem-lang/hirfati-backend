@@ -50,7 +50,14 @@ const demoUsers = [
     warranty: 1,
     jobsDone: 0,
     range: 25,
-    saved: []
+    saved: [],
+    experienceYears: 8,
+    serviceAreas: ['دمشق', 'ريف دمشق'],
+    portfolio: [
+      { title: 'صيانة لوحة كهرباء', image: null },
+      { title: 'تمديد إنارة منزلية', image: null },
+      { title: 'تركيب قواطع حماية', image: null }
+    ]
   },
   {
     id: 'admin',
@@ -114,7 +121,10 @@ async function seedDemoUsers(db) {
         specialty: user.specialty,
         verified: user.verified,
         warranty: user.warranty,
-        bio: user.bio
+        bio: user.bio,
+        experienceYears: user.experienceYears,
+        serviceAreas: user.serviceAreas,
+        portfolio: user.portfolio
       },
       $setOnInsert: {
         rating: user.rating,

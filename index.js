@@ -143,7 +143,7 @@ app.get('/api/jobs', authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/jobs', authenticate, asyncRoute(async (req, res) => {
-  const { title, desc, category, city, area, photos } = req.body;
+  const { title, desc, category, city, area, photos, budget, schedule, urgency } = req.body;
   const job = {
     id: id('j'),
     title,
@@ -156,6 +156,9 @@ app.post('/api/jobs', authenticate, asyncRoute(async (req, res) => {
     clientId: req.user.id,
     status: 'open',
     photos: photos || [],
+    budget: budget || null,
+    schedule: schedule || null,
+    urgency: urgency || 'normal',
     chosenCraftsman: null,
     cancelReason: null
   };
@@ -190,6 +193,7 @@ app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
     craftsmanId: req.user.id,
     note: note || null,
     estimate: estimate || null,
+    status: 'pending',
     createdAt: Date.now()
   };
   await cols().interests.insertOne(interest);
@@ -202,6 +206,38 @@ app.post('/api/interests', authenticate, asyncRoute(async (req, res) => {
   res.json({ id: interest.id });
 }));
 
+app.put('/api/interests/:id/status', authenticate, asyncRoute(async (req, res) => {
+  const { status } = req.body;
+  if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+  const interest = await cols().interests.findOne({ id: req.params.id });
+  if (!interest) return res.status(404).json({ error: 'Not found' });
+
+  const job = await cols().jobs.findOne({ id: interest.jobId });
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.clientId !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+
+  await cols().interests.updateOne({ id: interest.id }, { $set: { status } });
+
+  if (status === 'accepted') {
+    await Promise.all([
+      cols().jobs.updateOne(
+        { id: job.id },
+        { $set: { status: 'matched', chosenCraftsman: interest.craftsmanId } }
+      ),
+      cols().interests.updateMany(
+        { jobId: job.id, id: { $ne: interest.id }, status: 'pending' },
+        { $set: { status: 'rejected' } }
+      )
+    ]);
+    await addNotif(interest.craftsmanId, 'offer_accepted', `تم قبول عرضك: ${job.title.slice(0, 30)}`, job.id);
+  } else {
+    await addNotif(interest.craftsmanId, 'offer_rejected', `تم رفض عرضك: ${job.title.slice(0, 30)}`, job.id);
+  }
+
+  res.json({ success: true });
+}));
+
 // --- MESSAGES ---
 app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
   const messages = await cols().messages.find({
@@ -211,13 +247,15 @@ app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/messages', authenticate, asyncRoute(async (req, res) => {
-  const { jobId, receiverId, text } = req.body;
+  const { jobId, receiverId, text, image } = req.body;
+  if (!text && !image) return res.status(400).json({ error: 'Message text or image is required' });
   const message = {
     id: id('m'),
     jobId,
     senderId: req.user.id,
     receiverId,
-    text,
+    text: text || '',
+    image: image || null,
     at: Date.now()
   };
   await cols().messages.insertOne(message);
@@ -287,6 +325,12 @@ app.post('/api/reports', authenticate, asyncRoute(async (req, res) => {
   };
   await cols().reports.insertOne(report);
   res.json({ id: report.id });
+}));
+
+app.get('/api/reports', authenticate, asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  const reports = await cols().reports.find({}).sort({ at: -1 }).toArray();
+  res.json(normalizeMany(reports));
 }));
 
 // --- UPLOAD ---
