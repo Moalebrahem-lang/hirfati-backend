@@ -75,6 +75,13 @@ const hashOtp = (phone, otp) => crypto
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
   .digest('hex');
 const signAuthToken = user => jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
+const publicUser = user => {
+  const clean = stripMongoId(user);
+  delete clean.passwordHash;
+  delete clean.recoveryAnswerHash;
+  delete clean.auth;
+  return clean;
+};
 const isValidPin = pin => /^\d{4,6}$/.test(String(pin || ''));
 const normalizeRecoveryAnswer = answer => String(answer || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -189,7 +196,7 @@ app.post('/api/auth/password/register', asyncRoute(async (req, res) => {
   };
 
   await users.insertOne(user);
-  const cleanUser = stripMongoId(user);
+  const cleanUser = publicUser(user);
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
@@ -216,7 +223,7 @@ app.post('/api/auth/password/login', asyncRoute(async (req, res) => {
   }
 
   await clearPasswordFailures(phone);
-  const cleanUser = stripMongoId(user);
+  const cleanUser = publicUser(user);
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
@@ -273,7 +280,7 @@ app.post('/api/auth/password/recovery/verify', asyncRoute(async (req, res) => {
   );
   await logRecoveryAttempt(phone, 'success', 'pin_reset', req);
 
-  const updated = stripMongoId(await cols().users.findOne({ phone }));
+  const updated = publicUser(await cols().users.findOne({ phone }));
   res.json({ token: signAuthToken(updated), user: updated });
 }));
 
@@ -349,7 +356,7 @@ app.post('/api/auth/verify-otp', asyncRoute(async (req, res) => {
   await cols().otps.deleteOne({ phone, purpose: 'login' });
 
   if (user) {
-    const cleanUser = stripMongoId(user);
+    const cleanUser = publicUser(user);
     return res.json({ token: signAuthToken(cleanUser), user: cleanUser });
   }
 
@@ -396,7 +403,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     user = newUser;
   }
 
-  user = stripMongoId(user);
+  user = publicUser(user);
   res.json({ token: signAuthToken(user), user });
 }));
 
@@ -408,7 +415,7 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
   const user = await cols().users.findOne({ id: req.user.id });
   if (!user) return res.status(404).json({ error: 'غير موجود.' });
-  res.json(stripMongoId(user));
+  res.json(publicUser(user));
 }));
 
 app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
@@ -434,7 +441,7 @@ app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
 
 app.get('/api/users/craftsmen', authenticate, asyncRoute(async (req, res) => {
   const users = await cols().users.find({ role: 'craftsman' }).sort({ rating: -1, name: 1 }).toArray();
-  res.json(normalizeMany(users));
+  res.json(users.map(publicUser));
 }));
 
 // --- JOBS ---
