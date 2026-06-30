@@ -60,7 +60,11 @@ const upload = multer({
 });
 
 const id = prefix => prefix + Math.random().toString(36).slice(2, 10);
-const normalizePhone = phone => String(phone || '').replace(/\D/g, '');
+const normalizePhone = phone => {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.startsWith('963') && digits.length === 12) return `0${digits.slice(3)}`;
+  return digits;
+};
 const createOtp = () => String(crypto.randomInt(1000, 10000));
 const isDemoPhone = phone => DEMO_PHONES.includes(normalizePhone(phone));
 const hashOtp = (phone, otp) => crypto
