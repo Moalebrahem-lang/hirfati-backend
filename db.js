@@ -108,7 +108,11 @@ async function createIndexes(db) {
     db.collection('passwordRecoveryLogs').createIndex({ at: -1 }),
     db.collection('auditLogs').createIndex({ type: 1, at: -1 }),
     db.collection('auditLogs').createIndex({ userId: 1, at: -1 }),
-    db.collection('auditLogs').createIndex({ phone: 1, at: -1 })
+    db.collection('auditLogs').createIndex({ phone: 1, at: -1 }),
+    db.collection('identityRequests').createIndex({ id: 1 }, { unique: true }),
+    db.collection('identityRequests').createIndex({ type: 1, status: 1, createdAt: -1 }),
+    db.collection('identityRequests').createIndex({ userId: 1, createdAt: -1 }),
+    db.collection('identityRequests').createIndex({ phone: 1, createdAt: -1 })
   ]);
 }
 
@@ -198,7 +202,8 @@ function cols() {
     otps: database.collection('otps'),
     refreshTokens: database.collection('refreshTokens'),
     passwordRecoveryLogs: database.collection('passwordRecoveryLogs'),
-    auditLogs: database.collection('auditLogs')
+    auditLogs: database.collection('auditLogs'),
+    identityRequests: database.collection('identityRequests')
   };
 }
 

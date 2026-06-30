@@ -130,9 +130,14 @@ const normalizePhone = phone => {
   return digits;
 };
 const createOtp = () => String(crypto.randomInt(1000, 10000));
+const createResetCode = () => crypto.randomBytes(5).toString('base64url').replace(/[^A-Z0-9]/gi, '').toUpperCase().slice(0, 8).padEnd(8, '7');
 const hashOtp = (phone, otp) => crypto
   .createHash('sha256')
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
+  .digest('hex');
+const hashResetCode = (phone, code) => crypto
+  .createHash('sha256')
+  .update(`${normalizePhone(phone)}:${String(code || '').toUpperCase()}:${SECRET}`)
   .digest('hex');
 const signAuthToken = user => jwt.sign({ id: user.id, role: user.role, type: 'access' }, SECRET, { expiresIn: ACCESS_TOKEN_TTL });
 const hashRefreshToken = token => crypto.createHash('sha256').update(`${token}:${SECRET}`).digest('hex');
@@ -147,6 +152,16 @@ const encryptSensitive = value => {
     tag: cipher.getAuthTag().toString('base64url'),
     value: encrypted.toString('base64url')
   };
+};
+const decryptSensitive = payload => {
+  if (!payload?.value || !payload?.iv || !payload?.tag) return null;
+  const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, Buffer.from(payload.iv, 'base64url'));
+  decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(payload.value, 'base64url')),
+    decipher.final()
+  ]);
+  return decrypted.toString('utf8');
 };
 const publicUser = user => {
   const clean = stripMongoId(user);
@@ -167,6 +182,7 @@ const phoneSchema = Joi.string().trim().min(7).max(24).pattern(/^[+\d\s().-]+$/)
 const pinSchema = Joi.string().trim().pattern(/^\d{4,6}$/).required();
 const idSchema = Joi.string().trim().min(2).max(40).pattern(/^[A-Za-z0-9_-]+$/);
 const imageSchema = Joi.string().max(8 * 1024 * 1024);
+const identityImageSchema = Joi.string().trim().max(6 * 1024 * 1024).pattern(/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/).required();
 const schemas = {
   passwordRegister: Joi.object({
     phone: phoneSchema,
@@ -243,6 +259,26 @@ const schemas = {
   }),
   logout: Joi.object({
     refreshToken: Joi.string().trim().min(40).max(300)
+  }),
+  identitySubmit: Joi.object({
+    idCardImage: identityImageSchema,
+    selfieImage: identityImageSchema,
+    note: optionalText(500)
+  }),
+  identityRecoverySubmit: Joi.object({
+    phone: phoneSchema,
+    idCardImage: identityImageSchema,
+    selfieImage: identityImageSchema,
+    note: optionalText(500)
+  }),
+  identityDecision: Joi.object({
+    status: Joi.string().valid('approved', 'rejected').required(),
+    note: optionalText(500)
+  }),
+  identityReset: Joi.object({
+    phone: phoneSchema,
+    resetCode: Joi.string().trim().length(8).pattern(/^[A-Z0-9]+$/).required(),
+    newPin: pinSchema
   })
 };
 
@@ -260,6 +296,10 @@ const validateBody = schema => (req, res, next) => {
 const validateIdParam = (req, res, next) => {
   const { error } = idSchema.required().validate(req.params.id);
   if (error) return res.status(400).json({ error: 'المعرّف غير صحيح.' });
+  next();
+};
+const requireAdmin = (req, res, next) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
   next();
 };
 
@@ -512,6 +552,76 @@ app.post('/api/auth/password/recovery/verify', authLimiter, validateBody(schemas
   res.json(await authPayload(updated, req));
 }));
 
+app.post('/api/auth/password/recovery/identity', authLimiter, validateBody(schemas.identityRecoverySubmit), asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const user = await cols().users.findOne({ phone });
+  if (!user) return res.status(404).json({ error: 'لا يوجد حساب بهذا الرقم.' });
+
+  const existing = await cols().identityRequests.findOne({
+    type: 'password_recovery',
+    phone,
+    status: 'pending'
+  });
+  if (existing) return res.status(409).json({ error: 'يوجد طلب استرجاع قيد المراجعة.' });
+
+  const request = {
+    id: id('ir'),
+    type: 'password_recovery',
+    status: 'pending',
+    userId: user.id,
+    phone,
+    role: user.role,
+    name: user.name,
+    idCardImageEnc: encryptSensitive(req.body.idCardImage),
+    selfieImageEnc: encryptSensitive(req.body.selfieImage),
+    note: req.body.note || null,
+    createdAt: Date.now(),
+    reviewedAt: null,
+    reviewedBy: null
+  };
+  await cols().identityRequests.insertOne(request);
+  await logAudit('identity.password_recovery.requested', req, { phone, userId: user.id, result: 'pending', targetId: request.id });
+  res.json({ id: request.id, status: request.status, message: 'تم إرسال طلبك للمراجعة.' });
+}));
+
+app.post('/api/auth/password/recovery/identity/reset', authLimiter, validateBody(schemas.identityReset), asyncRoute(async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const resetCode = String(req.body.resetCode || '').toUpperCase();
+  const request = await cols().identityRequests.findOne({
+    type: 'password_recovery',
+    phone,
+    status: 'approved',
+    resetCodeHash: hashResetCode(phone, resetCode),
+    resetUsedAt: null,
+    resetExpiresAt: { $gt: Date.now() }
+  });
+  if (!request) {
+    await logAudit('identity.password_recovery.reset', req, { phone, result: 'failed', meta: { reason: 'invalid_code' } });
+    return res.status(401).json({ error: 'كود الاسترجاع غير صحيح أو منتهي.' });
+  }
+
+  const passwordHash = await bcrypt.hash(String(req.body.newPin), PASSWORD_BCRYPT_ROUNDS);
+  await cols().users.updateOne(
+    { id: request.userId },
+    {
+      $set: {
+        passwordHash,
+        passwordSetAt: Date.now(),
+        'auth.failedLoginCount': 0,
+        'auth.loginBlockedUntil': 0,
+        'auth.passwordRecoveredAt': Date.now()
+      }
+    }
+  );
+  await cols().identityRequests.updateOne(
+    { id: request.id },
+    { $set: { resetUsedAt: Date.now(), resetCodeEnc: null } }
+  );
+  const user = await cols().users.findOne({ id: request.userId });
+  await logAudit('identity.password_recovery.reset', req, { phone, userId: user.id, result: 'success', targetId: request.id });
+  res.json(await authPayload(user, req));
+}));
+
 app.post('/api/auth/otp', authLimiter, requireOtpEnabled, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -704,6 +814,88 @@ app.put('/api/users/profile', authenticate, validateBody(schemas.profile), async
 app.get('/api/users/craftsmen', authenticate, asyncRoute(async (req, res) => {
   const users = await cols().users.find({ role: 'craftsman' }).sort({ rating: -1, name: 1 }).toArray();
   res.json(users.map(publicUser));
+}));
+
+// --- IDENTITY REVIEW ---
+app.post('/api/identity-requests', authenticate, validateBody(schemas.identitySubmit), asyncRoute(async (req, res) => {
+  const user = await cols().users.findOne({ id: req.user.id });
+  if (!user) return res.status(404).json({ error: 'غير موجود.' });
+  if (user.role !== 'craftsman') return res.status(403).json({ error: 'توثيق الهوية متاح للحرفيين حالياً.' });
+
+  const existing = await cols().identityRequests.findOne({
+    type: 'craftsman_verification',
+    userId: req.user.id,
+    status: 'pending'
+  });
+  if (existing) return res.status(409).json({ error: 'يوجد طلب توثيق قيد المراجعة.' });
+
+  const request = {
+    id: id('ir'),
+    type: 'craftsman_verification',
+    status: 'pending',
+    userId: user.id,
+    phone: user.phone,
+    role: user.role,
+    name: user.name,
+    idCardImageEnc: encryptSensitive(req.body.idCardImage),
+    selfieImageEnc: encryptSensitive(req.body.selfieImage),
+    note: req.body.note || null,
+    createdAt: Date.now(),
+    reviewedAt: null,
+    reviewedBy: null
+  };
+  await cols().identityRequests.insertOne(request);
+  await logAudit('identity.verification.requested', req, { userId: user.id, phone: user.phone, result: 'pending', targetId: request.id });
+  res.json({ id: request.id, status: request.status, message: 'تم إرسال طلب التوثيق.' });
+}));
+
+app.get('/api/admin/identity-requests', authenticate, requireAdmin, asyncRoute(async (req, res) => {
+  const requests = await cols().identityRequests.find({}).sort({ createdAt: -1 }).toArray();
+  res.json(requests.map(request => {
+    const clean = stripMongoId(request);
+    clean.idCardImage = decryptSensitive(request.idCardImageEnc);
+    clean.selfieImage = decryptSensitive(request.selfieImageEnc);
+    clean.resetCode = decryptSensitive(request.resetCodeEnc);
+    delete clean.idCardImageEnc;
+    delete clean.selfieImageEnc;
+    delete clean.resetCodeEnc;
+    delete clean.resetCodeHash;
+    return clean;
+  }));
+}));
+
+app.put('/api/admin/identity-requests/:id/status', authenticate, requireAdmin, validateIdParam, validateBody(schemas.identityDecision), asyncRoute(async (req, res) => {
+  const request = await cols().identityRequests.findOne({ id: req.params.id });
+  if (!request) return res.status(404).json({ error: 'الطلب غير موجود.' });
+  if (request.status !== 'pending') return res.status(409).json({ error: 'تمت مراجعة هذا الطلب مسبقاً.' });
+
+  const update = {
+    status: req.body.status,
+    adminNote: req.body.note || null,
+    reviewedAt: Date.now(),
+    reviewedBy: req.user.id
+  };
+  let resetCode = null;
+  if (req.body.status === 'approved' && request.type === 'craftsman_verification') {
+    await cols().users.updateOne({ id: request.userId }, { $set: { verified: 1, identityVerifiedAt: Date.now() } });
+  }
+  if (req.body.status === 'approved' && request.type === 'password_recovery') {
+    resetCode = createResetCode();
+    update.resetCodeHash = hashResetCode(request.phone, resetCode);
+    update.resetCodeEnc = encryptSensitive(resetCode);
+    update.resetExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+    update.resetUsedAt = null;
+  }
+
+  await cols().identityRequests.updateOne({ id: request.id }, { $set: update });
+  await logAudit('identity.reviewed', req, {
+    userId: request.userId,
+    phone: request.phone,
+    result: req.body.status,
+    targetId: request.id,
+    meta: { type: request.type }
+  });
+  res.json({ success: true, resetCode });
 }));
 
 // --- JOBS ---
