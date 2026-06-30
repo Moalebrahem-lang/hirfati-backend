@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { MongoClient } = require('mongodb');
+const mongoose = require('mongoose');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.MONGODB_DB || 'hirfati';
@@ -8,14 +8,6 @@ const DB_NAME = process.env.MONGODB_DB || 'hirfati';
 if (!MONGODB_URI) {
   throw new Error('MONGODB_URI is required. Set it to your MongoDB Atlas connection string.');
 }
-
-const client = new MongoClient(MONGODB_URI, {
-  maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 50),
-  minPoolSize: Number(process.env.MONGODB_MIN_POOL_SIZE || 2),
-  retryWrites: true,
-  tls: true,
-  tlsAllowInvalidCertificates: false
-});
 
 let database;
 let lastError = null;
@@ -146,8 +138,15 @@ async function seedDemoUsers(db) {
 async function connect() {
   if (database) return database;
   try {
-    await client.connect();
-    database = client.db(DB_NAME);
+    await mongoose.connect(process.env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+      ssl: true,
+      tls: true,
+      tlsAllowInvalidCertificates: true,
+      tlsAllowInvalidHostnames: true,
+      family: 4
+    });
+    database = mongoose.connection.useDb(DB_NAME).db;
     await createIndexes(database);
     await seedDemoUsers(database);
     lastError = null;
