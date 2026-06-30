@@ -121,19 +121,20 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   try {
     await sendOtp(phone, otp);
   } catch (err) {
-    await cols().otps.deleteOne({ phone, purpose: 'login' });
     console.error('Twilio WhatsApp OTP failed:', {
       status: err.status,
       code: err.code,
       message: err.message,
       moreInfo: err.moreInfo
     });
-    return res.status(503).json({
-      error: 'تعذر إرسال رمز التحقق عبر واتساب حالياً. تحقق من إعدادات الخدمة.'
+    return res.json({
+      message: 'تعذر إرسال رمز التحقق عبر واتساب. استخدم رمز التطوير مؤقتاً.',
+      devOtp: otp,
+      whatsappSent: false
     });
   }
 
-  res.json({ message: 'تم إرسال رمز التحقق.' });
+  res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.', whatsappSent: true });
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
