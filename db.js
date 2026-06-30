@@ -1,9 +1,11 @@
 require('dotenv').config();
 
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.MONGODB_DB || 'hirfati';
+const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
 
 if (!MONGODB_URI) {
   throw new Error('MONGODB_URI is required. Set it to your MongoDB Atlas connection string.');
@@ -73,6 +75,10 @@ const demoUsers = [
   }
 ];
 
+const demoPins = {
+  '0991112233': '1234'
+};
+
 function stripMongoId(doc) {
   if (!doc) return doc;
   const { _id, ...rest } = doc;
@@ -118,9 +124,8 @@ async function createIndexes(db) {
 
 async function seedDemoUsers(db) {
   const users = db.collection('users');
-  await Promise.all(demoUsers.map(user => users.updateOne(
-    { phone: user.phone },
-    {
+  await Promise.all(demoUsers.map(async user => {
+    const update = {
       $set: {
         id: user.id,
         name: user.name,
@@ -142,9 +147,16 @@ async function seedDemoUsers(db) {
         range: user.range,
         saved: user.saved
       }
-    },
-    { upsert: true }
-  )));
+    };
+    if (demoPins[user.phone]) {
+      update.$set.passwordHash = await bcrypt.hash(demoPins[user.phone], PASSWORD_BCRYPT_ROUNDS);
+      update.$set.passwordSetAt = Date.now();
+      update.$set.recoveryQuestion = 'ما اسم المدرسة الأولى؟';
+      update.$set.recoveryAnswerHash = await bcrypt.hash('تجريبي', PASSWORD_BCRYPT_ROUNDS);
+      update.$set.auth = { failedLoginCount: 0, loginBlockedUntil: 0 };
+    }
+    return users.updateOne({ phone: user.phone }, update, { upsert: true });
+  }));
 }
 
 async function connect() {
