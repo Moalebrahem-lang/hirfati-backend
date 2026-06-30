@@ -101,6 +101,9 @@ async function createIndexes(db) {
     db.collection('reports').createIndex({ targetId: 1, at: -1 }),
     db.collection('otps').createIndex({ phone: 1, purpose: 1 }),
     db.collection('otps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    db.collection('refreshTokens').createIndex({ tokenHash: 1 }, { unique: true }),
+    db.collection('refreshTokens').createIndex({ userId: 1, expiresAt: -1 }),
+    db.collection('refreshTokens').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     db.collection('passwordRecoveryLogs').createIndex({ phone: 1, at: -1 }),
     db.collection('passwordRecoveryLogs').createIndex({ at: -1 }),
     db.collection('auditLogs').createIndex({ type: 1, at: -1 }),
@@ -193,6 +196,7 @@ function cols() {
     reviews: database.collection('reviews'),
     reports: database.collection('reports'),
     otps: database.collection('otps'),
+    refreshTokens: database.collection('refreshTokens'),
     passwordRecoveryLogs: database.collection('passwordRecoveryLogs'),
     auditLogs: database.collection('auditLogs')
   };

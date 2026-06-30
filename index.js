@@ -33,6 +33,9 @@ const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
 const PASSWORD_LOCK_MS = Number(process.env.PASSWORD_LOCK_MS || 15 * 60 * 1000);
 const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTEMPTS || 5);
 const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
+const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '20m';
+const REFRESH_TOKEN_DAYS = Number(process.env.REFRESH_TOKEN_DAYS || 7);
+const ENCRYPTION_KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || SECRET).digest();
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -123,12 +126,27 @@ const hashOtp = (phone, otp) => crypto
   .createHash('sha256')
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
   .digest('hex');
-const signAuthToken = user => jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
+const signAuthToken = user => jwt.sign({ id: user.id, role: user.role, type: 'access' }, SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+const hashRefreshToken = token => crypto.createHash('sha256').update(`${token}:${SECRET}`).digest('hex');
+const encryptSensitive = value => {
+  if (!value) return null;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
+  return {
+    alg: 'aes-256-gcm',
+    iv: iv.toString('base64url'),
+    tag: cipher.getAuthTag().toString('base64url'),
+    value: encrypted.toString('base64url')
+  };
+};
 const publicUser = user => {
   const clean = stripMongoId(user);
   delete clean.passwordHash;
   delete clean.recoveryAnswerHash;
   delete clean.auth;
+  delete clean.recoveryEmail;
+  delete clean.recoveryEmailEnc;
   return clean;
 };
 const isValidPin = pin => /^\d{4,6}$/.test(String(pin || ''));
@@ -211,6 +229,12 @@ const schemas = {
     type: Joi.string().valid('user', 'job', 'message', 'review').required(),
     targetId: idSchema.required(),
     reason: safeText(400).required()
+  }),
+  refresh: Joi.object({
+    refreshToken: Joi.string().trim().min(40).max(300).required()
+  }),
+  logout: Joi.object({
+    refreshToken: Joi.string().trim().min(40).max(300)
   })
 };
 
@@ -235,12 +259,42 @@ const authenticate = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'يرجى تسجيل الدخول.' });
   try {
-    req.user = jwt.verify(token, SECRET);
+    const payload = jwt.verify(token, SECRET);
+    if (payload.type !== 'access') return res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
+    req.user = payload;
     next();
   } catch (err) {
     res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
   }
 };
+
+async function issueRefreshToken(user, req) {
+  const refreshToken = crypto.randomBytes(48).toString('base64url');
+  await cols().refreshTokens.insertOne({
+    id: id('rt'),
+    userId: user.id,
+    tokenHash: hashRefreshToken(refreshToken),
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000),
+    revokedAt: null,
+    ip: ipOf(req) || null,
+    userAgent: req.headers['user-agent'] || null
+  });
+  return refreshToken;
+}
+
+async function authPayload(user, req) {
+  const cleanUser = publicUser(user);
+  const refreshToken = await issueRefreshToken(cleanUser, req);
+  const accessToken = signAuthToken(cleanUser);
+  return {
+    token: accessToken,
+    accessToken,
+    refreshToken,
+    expiresIn: ACCESS_TOKEN_TTL,
+    user: cleanUser
+  };
+}
 
 async function addNotif(userId, type, text, jobId) {
   await cols().notifications.insertOne({
@@ -350,14 +404,13 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
     passwordSetAt: Date.now(),
     recoveryQuestion: String(recoveryQuestion).trim(),
     recoveryAnswerHash,
-    recoveryEmail: recoveryEmail ? String(recoveryEmail).trim().toLowerCase() : null,
+    recoveryEmailEnc: encryptSensitive(recoveryEmail ? String(recoveryEmail).trim().toLowerCase() : null),
     auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
   };
 
   await users.insertOne(user);
   await logAudit('auth.register', req, { phone, userId: user.id, result: 'success', meta: { role: user.role } });
-  const cleanUser = publicUser(user);
-  res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+  res.json(await authPayload(user, req));
 }));
 
 app.post('/api/auth/password/login', authLimiter, validateBody(schemas.passwordLogin), asyncRoute(async (req, res) => {
@@ -387,8 +440,7 @@ app.post('/api/auth/password/login', authLimiter, validateBody(schemas.passwordL
 
   await clearPasswordFailures(phone);
   await logAudit('auth.login', req, { phone, userId: user.id, result: 'success' });
-  const cleanUser = publicUser(user);
-  res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+  res.json(await authPayload(user, req));
 }));
 
 app.post('/api/auth/password/recovery/start', authLimiter, validateBody(schemas.recoveryStart), asyncRoute(async (req, res) => {
@@ -448,8 +500,8 @@ app.post('/api/auth/password/recovery/verify', authLimiter, validateBody(schemas
   await logRecoveryAttempt(phone, 'success', 'pin_reset', req);
   await logAudit('auth.password_recovery', req, { phone, userId: user.id, result: 'success' });
 
-  const updated = publicUser(await cols().users.findOne({ phone }));
-  res.json({ token: signAuthToken(updated), user: updated });
+  const updated = await cols().users.findOne({ phone });
+  res.json(await authPayload(updated, req));
 }));
 
 app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
@@ -524,8 +576,7 @@ app.post('/api/auth/verify-otp', authLimiter, validateBody(schemas.otpVerify), a
   await cols().otps.deleteOne({ phone, purpose: 'login' });
 
   if (user) {
-    const cleanUser = publicUser(user);
-    return res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+    return res.json(await authPayload(user, req));
   }
 
   const registrationToken = jwt.sign({ phone, purpose: 'registration' }, SECRET, { expiresIn: '10m' });
@@ -571,13 +622,43 @@ app.post('/api/auth/register', authLimiter, validateBody(schemas.legacyRegister)
     user = newUser;
   }
 
-  user = publicUser(user);
-  res.json({ token: signAuthToken(user), user });
+  res.json(await authPayload(user, req));
 }));
 
 app.post('/api/auth/login', authLimiter, (req, res) => {
   res.status(410).json({ error: 'استخدم /api/auth/verify-otp للتحقق من رمز الدخول.' });
 });
+
+app.post('/api/auth/refresh', validateBody(schemas.refresh), asyncRoute(async (req, res) => {
+  const tokenHash = hashRefreshToken(req.body.refreshToken);
+  const stored = await cols().refreshTokens.findOne({ tokenHash, revokedAt: null });
+  if (!stored || stored.expiresAt < new Date()) {
+    await logAudit('auth.refresh', req, { result: 'failed', meta: { reason: 'invalid_refresh_token' } });
+    return res.status(401).json({ error: 'جلسة الدخول منتهية. سجّل الدخول من جديد.' });
+  }
+
+  const user = await cols().users.findOne({ id: stored.userId });
+  if (!user) {
+    await cols().refreshTokens.updateOne({ id: stored.id }, { $set: { revokedAt: new Date() } });
+    await logAudit('auth.refresh', req, { userId: stored.userId, result: 'failed', meta: { reason: 'missing_user' } });
+    return res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
+  }
+
+  await cols().refreshTokens.updateOne({ id: stored.id }, { $set: { revokedAt: new Date(), rotatedAt: new Date() } });
+  await logAudit('auth.refresh', req, { userId: user.id, result: 'success' });
+  res.json(await authPayload(user, req));
+}));
+
+app.post('/api/auth/logout', validateBody(schemas.logout), asyncRoute(async (req, res) => {
+  if (req.body.refreshToken) {
+    await cols().refreshTokens.updateOne(
+      { tokenHash: hashRefreshToken(req.body.refreshToken) },
+      { $set: { revokedAt: new Date() } }
+    );
+  }
+  await logAudit('auth.logout', req, { result: 'success' });
+  res.json({ success: true });
+}));
 
 // --- USERS ---
 app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
