@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 5000;
 const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const API_ORIGIN = process.env.CORS_ORIGIN || '*';
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
-const DEMO_OTP_ENABLED = process.env.DEMO_OTP_ENABLED === 'true';
+const DEMO_PHONES = ['0991112233', '0944556677', '0900000000'];
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -139,7 +139,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
   if (!submittedOtp || submittedOtp.length !== 4) return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
 
-  const demoOtpAllowed = DEMO_OTP_ENABLED && submittedOtp === '1234' && ['0991112233', '0944556677', '0900000000'].includes(phone);
+  const demoOtpAllowed = submittedOtp === '1234' && DEMO_PHONES.includes(phone);
   if (!demoOtpAllowed) {
     const otpRecord = await cols().otps.findOne({ phone, purpose: 'login' });
     if (!otpRecord || otpRecord.expiresAt < new Date()) {
@@ -215,7 +215,7 @@ app.put('/api/users/profile', authenticate, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/users/craftsmen', authenticate, asyncRoute(async (req, res) => {
-  const users = await cols().users.find({ role: { $in: ['craftsman', 'client'] } }).sort({ role: 1, name: 1 }).toArray();
+  const users = await cols().users.find({ role: 'craftsman' }).sort({ rating: -1, name: 1 }).toArray();
   res.json(normalizeMany(users));
 }));
 
