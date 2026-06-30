@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 5000;
 const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const API_ORIGIN = process.env.CORS_ORIGIN || '*';
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
-const DEMO_PHONES = ['0991112233', '0944556677', '0900000000'];
+const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
 
 app.disable('x-powered-by');
 app.use(helmet({
@@ -66,11 +66,11 @@ const normalizePhone = phone => {
   return digits;
 };
 const createOtp = () => String(crypto.randomInt(1000, 10000));
-const isDemoPhone = phone => DEMO_PHONES.includes(normalizePhone(phone));
 const hashOtp = (phone, otp) => crypto
   .createHash('sha256')
   .update(`${normalizePhone(phone)}:${otp}:${SECRET}`)
   .digest('hex');
+const signAuthToken = user => jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
 
 const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -107,11 +107,13 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
-  if (isDemoPhone(phone)) {
-    return res.json({
-      message: 'استخدم رمز التحقق التجريبي.',
-      devOtp: '1234',
-      whatsappSent: false
+  const existingOtp = await cols().otps.findOne({ phone, purpose: 'login' });
+  const lastSentAt = existingOtp?.lastSentAt ? new Date(existingOtp.lastSentAt).getTime() : 0;
+  const retryAfterMs = OTP_RATE_LIMIT_MS - (Date.now() - lastSentAt);
+  if (retryAfterMs > 0) {
+    return res.status(429).json({
+      error: 'تم إرسال رمز مؤخراً. انتظر قليلاً قبل طلب رمز جديد.',
+      retryAfterSeconds: Math.ceil(retryAfterMs / 1000)
     });
   }
 
@@ -125,7 +127,8 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
         hash: hashOtp(phone, otp),
         attempts: 0,
         expiresAt: new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000),
-        createdAt: new Date()
+        createdAt: new Date(),
+        lastSentAt: new Date()
       }
     },
     { upsert: true }
@@ -140,52 +143,68 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
       message: err.message,
       moreInfo: err.moreInfo
     });
-    return res.json({
-      message: 'تعذر إرسال رمز التحقق عبر واتساب. استخدم رمز التطوير مؤقتاً.',
-      devOtp: otp,
-      whatsappSent: false
-    });
+    return res.status(503).json({ error: 'تعذر إرسال رمز التحقق عبر واتساب حالياً.' });
   }
 
-  res.json({
-    message: 'تم إرسال رمز التحقق عبر واتساب. رمز التطوير ظاهر مؤقتاً للتجربة.',
-    devOtp: otp,
-    whatsappSent: true
-  });
+  res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.' });
 }));
 
-app.post('/api/auth/login', asyncRoute(async (req, res) => {
+app.post('/api/auth/verify-otp', asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
-  const { otp, name, role, city, specialty } = req.body;
+  const { otp } = req.body;
   const submittedOtp = String(otp || '').replace(/\D/g, '');
 
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
   if (!submittedOtp || submittedOtp.length !== 4) return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
 
-  const demoOtpAllowed = submittedOtp === '1234' && isDemoPhone(phone);
-  if (!demoOtpAllowed) {
-    const otpRecord = await cols().otps.findOne({ phone, purpose: 'login' });
-    if (!otpRecord || otpRecord.expiresAt < new Date()) {
-      return res.status(400).json({ error: 'انتهت صلاحية رمز التحقق. اطلب رمزاً جديداً.' });
-    }
-    if (otpRecord.attempts >= 5) {
-      await cols().otps.deleteOne({ phone, purpose: 'login' });
-      return res.status(429).json({ error: 'محاولات كثيرة. اطلب رمزاً جديداً.' });
-    }
-    if (otpRecord.hash !== hashOtp(phone, submittedOtp)) {
-      await cols().otps.updateOne({ phone, purpose: 'login' }, { $inc: { attempts: 1 } });
-      return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
-    }
+  const otpRecord = await cols().otps.findOne({ phone, purpose: 'login' });
+  if (!otpRecord || otpRecord.expiresAt < new Date()) {
+    return res.status(400).json({ error: 'انتهت صلاحية رمز التحقق. اطلب رمزاً جديداً.' });
+  }
+  if (otpRecord.attempts >= 5) {
+    await cols().otps.deleteOne({ phone, purpose: 'login' });
+    return res.status(429).json({ error: 'محاولات كثيرة. اطلب رمزاً جديداً.' });
+  }
+  if (otpRecord.hash !== hashOtp(phone, submittedOtp)) {
+    await cols().otps.updateOne({ phone, purpose: 'login' }, { $inc: { attempts: 1 } });
+    return res.status(400).json({ error: 'رمز التحقق غير صحيح.' });
   }
 
   const { users } = cols();
-  let user = await users.findOne({ phone });
+  const user = await users.findOne({ phone });
+  await cols().otps.deleteOne({ phone, purpose: 'login' });
+
+  if (user) {
+    const cleanUser = stripMongoId(user);
+    return res.json({ token: signAuthToken(cleanUser), user: cleanUser });
+  }
+
+  const registrationToken = jwt.sign({ phone, purpose: 'registration' }, SECRET, { expiresIn: '10m' });
+  res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true, registrationToken });
+}));
+
+app.post('/api/auth/register', asyncRoute(async (req, res) => {
+  const { registrationToken, name, role, city, specialty } = req.body;
+  if (!registrationToken) return res.status(400).json({ error: 'جلسة التسجيل غير صالحة.' });
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'أدخل الاسم.' });
+
+  let payload;
+  try {
+    payload = jwt.verify(registrationToken, SECRET);
+  } catch (err) {
+    return res.status(401).json({ error: 'انتهت صلاحية جلسة التسجيل. اطلب رمزاً جديداً.' });
+  }
+  if (payload.purpose !== 'registration' || !payload.phone) {
+    return res.status(401).json({ error: 'جلسة التسجيل غير صالحة.' });
+  }
+
+  const { users } = cols();
+  let user = await users.findOne({ phone: payload.phone });
   if (!user) {
-    if (!name) return res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true });
     const newUser = {
       id: id('u'),
       name,
-      phone,
+      phone: payload.phone,
       role: role || 'client',
       city: city || 'دمشق',
       avatar: (name || '').slice(0, 2),
@@ -203,14 +222,13 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     user = newUser;
   }
 
-  if (!demoOtpAllowed) {
-    await cols().otps.deleteOne({ phone, purpose: 'login' });
-  }
-
   user = stripMongoId(user);
-  const token = jwt.sign({ id: user.id, role: user.role }, SECRET, { expiresIn: '30d' });
-  res.json({ token, user });
+  res.json({ token: signAuthToken(user), user });
 }));
+
+app.post('/api/auth/login', (req, res) => {
+  res.status(410).json({ error: 'استخدم /api/auth/verify-otp للتحقق من رمز الدخول.' });
+});
 
 // --- USERS ---
 app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
