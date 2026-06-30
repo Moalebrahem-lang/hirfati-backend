@@ -6,6 +6,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const Joi = require('joi');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -16,7 +17,17 @@ const { sendOtp } = require('./sms');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
-const API_ORIGIN = process.env.CORS_ORIGIN || '*';
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://hirfati-backend-production.up.railway.app',
+  'capacitor://localhost',
+  'http://localhost',
+  'http://localhost:3000',
+  'http://localhost:8100'
+];
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEFAULT_ALLOWED_ORIGINS.join(','))
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
 const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
 const PASSWORD_LOCK_MS = Number(process.env.PASSWORD_LOCK_MS || 15 * 60 * 1000);
@@ -28,15 +39,30 @@ app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false
 }));
-app.use(cors({ origin: API_ORIGIN }));
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS origin is not allowed.'));
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: '50mb' }));
-app.use('/api', rateLimit({
+const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_MAX || 300),
+  max: Number(process.env.RATE_LIMIT_MAX || 100),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'طلبات كثيرة. حاول لاحقاً.' }
-}));
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 5),
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: false,
+  message: { error: 'محاولات دخول كثيرة. حاول بعد 15 دقيقة.' }
+});
+app.use('/api', apiLimiter);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static(path.join(__dirname, '../frontend/build')));
 
@@ -151,7 +177,7 @@ app.get('/api/health', asyncRoute(async (req, res) => {
 }));
 
 // --- AUTH ---
-app.post('/api/auth/password/register', asyncRoute(async (req, res) => {
+app.post('/api/auth/password/register', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { pin, name, role, city, specialty, recoveryQuestion, recoveryAnswer, recoveryEmail } = req.body;
 
@@ -200,7 +226,7 @@ app.post('/api/auth/password/register', asyncRoute(async (req, res) => {
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
-app.post('/api/auth/password/login', asyncRoute(async (req, res) => {
+app.post('/api/auth/password/login', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { pin } = req.body;
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -227,7 +253,7 @@ app.post('/api/auth/password/login', asyncRoute(async (req, res) => {
   res.json({ token: signAuthToken(cleanUser), user: cleanUser });
 }));
 
-app.post('/api/auth/password/recovery/start', asyncRoute(async (req, res) => {
+app.post('/api/auth/password/recovery/start', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
@@ -241,7 +267,7 @@ app.post('/api/auth/password/recovery/start', asyncRoute(async (req, res) => {
   res.json({ recoveryQuestion: user.recoveryQuestion });
 }));
 
-app.post('/api/auth/password/recovery/verify', asyncRoute(async (req, res) => {
+app.post('/api/auth/password/recovery/verify', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { recoveryAnswer, newPin } = req.body;
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -284,7 +310,7 @@ app.post('/api/auth/password/recovery/verify', asyncRoute(async (req, res) => {
   res.json({ token: signAuthToken(updated), user: updated });
 }));
 
-app.post('/api/auth/otp', asyncRoute(async (req, res) => {
+app.post('/api/auth/otp', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
 
@@ -330,7 +356,7 @@ app.post('/api/auth/otp', asyncRoute(async (req, res) => {
   res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.' });
 }));
 
-app.post('/api/auth/verify-otp', asyncRoute(async (req, res) => {
+app.post('/api/auth/verify-otp', authLimiter, asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { otp } = req.body;
   const submittedOtp = String(otp || '').replace(/\D/g, '');
@@ -364,7 +390,7 @@ app.post('/api/auth/verify-otp', asyncRoute(async (req, res) => {
   res.status(404).json({ error: 'المستخدم غير موجود.', needsRegistration: true, registrationToken });
 }));
 
-app.post('/api/auth/register', asyncRoute(async (req, res) => {
+app.post('/api/auth/register', authLimiter, asyncRoute(async (req, res) => {
   const { registrationToken, name, role, city, specialty } = req.body;
   if (!registrationToken) return res.status(400).json({ error: 'جلسة التسجيل غير صالحة.' });
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'أدخل الاسم.' });
@@ -407,7 +433,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   res.json({ token: signAuthToken(user), user });
 }));
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', authLimiter, (req, res) => {
   res.status(410).json({ error: 'استخدم /api/auth/verify-otp للتحقق من رمز الدخول.' });
 });
 
