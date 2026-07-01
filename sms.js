@@ -11,6 +11,14 @@ const birdTemplateName = process.env.BIRD_WHATSAPP_TEMPLATE_NAME;
 const birdTemplateProjectId = process.env.BIRD_WHATSAPP_TEMPLATE_PROJECT_ID;
 const birdTemplateVersion = process.env.BIRD_WHATSAPP_TEMPLATE_VERSION;
 const birdTemplateLocale = process.env.BIRD_WHATSAPP_TEMPLATE_LOCALE || 'ar';
+const dialog360ApiKey = process.env.DIALOG360_API_KEY;
+const dialog360TemplateName = process.env.DIALOG360_TEMPLATE_NAME || 'hirfati_otp';
+const dialog360TemplateLanguage = process.env.DIALOG360_TEMPLATE_LANGUAGE || 'ar';
+const dialog360Endpoint = process.env.DIALOG360_ENDPOINT || 'https://waba-v2.360dialog.io/messages';
+const genericOtpUrl = process.env.GENERIC_WHATSAPP_OTP_URL;
+const genericApiKey = process.env.GENERIC_WHATSAPP_API_KEY;
+const genericAuthHeader = process.env.GENERIC_WHATSAPP_AUTH_HEADER || 'Authorization';
+const genericAuthPrefix = process.env.GENERIC_WHATSAPP_AUTH_PREFIX || 'Bearer';
 
 const client = accountSid && authToken ? twilio(accountSid, authToken) : null;
 
@@ -23,7 +31,10 @@ function toE164(phone) {
 }
 
 function isConfigured() {
+  if (whatsappProvider === 'disabled' || whatsappProvider === 'none') return false;
   if (whatsappProvider === 'bird') return Boolean(birdAccessKey && birdWorkspaceId && birdChannelId);
+  if (whatsappProvider === '360dialog') return Boolean(dialog360ApiKey && dialog360TemplateName);
+  if (whatsappProvider === 'generic') return Boolean(genericOtpUrl);
   return Boolean(client && whatsappFrom);
 }
 
@@ -76,8 +87,87 @@ async function sendBirdOtp(phone, code) {
   return response.json();
 }
 
+async function send360DialogOtp(phone, code) {
+  if (!dialog360ApiKey || !dialog360TemplateName) {
+    const err = new Error('360dialog WhatsApp is not configured.');
+    err.code = 'WHATSAPP_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const response = await fetch(dialog360Endpoint, {
+    method: 'POST',
+    headers: {
+      'D360-API-KEY': dialog360ApiKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: toE164(phone).replace(/^\+/, ''),
+      type: 'template',
+      template: {
+        name: dialog360TemplateName,
+        language: { code: dialog360TemplateLanguage },
+        components: [{
+          type: 'body',
+          parameters: [{ type: 'text', text: String(code) }]
+        }]
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const err = new Error(`360dialog WhatsApp rejected the message: ${response.status}`);
+    err.code = 'WHATSAPP_SEND_FAILED';
+    err.providerResponse = body.slice(0, 500);
+    throw err;
+  }
+
+  return response.json();
+}
+
+async function sendGenericOtp(phone, code) {
+  if (!genericOtpUrl) {
+    const err = new Error('Generic WhatsApp OTP provider is not configured.');
+    err.code = 'WHATSAPP_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (genericApiKey) headers[genericAuthHeader] = genericAuthPrefix ? `${genericAuthPrefix} ${genericApiKey}` : genericApiKey;
+  const message = `رمز التحقق لحرفتي هو: ${code}`;
+  const response = await fetch(genericOtpUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      phone: toE164(phone),
+      to: toE164(phone),
+      code: String(code),
+      message
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const err = new Error(`Generic WhatsApp OTP provider rejected the message: ${response.status}`);
+    err.code = 'WHATSAPP_SEND_FAILED';
+    err.providerResponse = body.slice(0, 500);
+    throw err;
+  }
+
+  return response.json();
+}
+
 async function sendOtp(phone, code) {
+  if (whatsappProvider === 'disabled' || whatsappProvider === 'none') {
+    const err = new Error('WhatsApp provider is disabled.');
+    err.code = 'WHATSAPP_NOT_CONFIGURED';
+    throw err;
+  }
   if (whatsappProvider === 'bird') return sendBirdOtp(phone, code);
+  if (whatsappProvider === '360dialog') return send360DialogOtp(phone, code);
+  if (whatsappProvider === 'generic') return sendGenericOtp(phone, code);
 
   if (!client) {
     throw new Error('TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are required.');
