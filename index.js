@@ -13,6 +13,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { connect, cols, stripMongoId, normalizeMany, healthCheck } = require('./db');
 const { sendOtp } = require('./sms');
+const createAdminDashboard = require('./adminDashboard');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -54,6 +55,7 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 const hasNoSqlOperator = value => {
   if (!value || typeof value !== 'object') return false;
   if (Array.isArray(value)) return value.some(hasNoSqlOperator);
@@ -305,13 +307,17 @@ const requireAdmin = (req, res, next) => {
   next();
 };
 
-const authenticate = (req, res, next) => {
+const authenticate = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'يرجى تسجيل الدخول.' });
   try {
     const payload = jwt.verify(token, SECRET);
     if (payload.type !== 'access') return res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
+    const user = await cols().users.findOne({ id: payload.id });
+    if (!user) return res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
+    if (user.disabledAt) return res.status(403).json({ error: 'تم تعطيل هذا الحساب من الإدارة.' });
     req.user = payload;
+    req.currentUser = user;
     next();
   } catch (err) {
     res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
@@ -537,6 +543,7 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
     jobsDone: 0,
     range: 25,
     saved: [],
+    createdAt: Date.now(),
     passwordHash,
     passwordSetAt: Date.now(),
     recoveryQuestion: String(recoveryQuestion).trim(),
@@ -561,6 +568,10 @@ app.post('/api/auth/password/login', authLimiter, validateBody(schemas.passwordL
     await recordPasswordFailure(phone);
     await logAudit('auth.login', req, { phone, result: 'failed', meta: { reason: 'invalid_credentials' } });
     return res.status(401).json({ error: 'رقم الهاتف أو PIN غير صحيح.' });
+  }
+  if (user.disabledAt) {
+    await logAudit('auth.login', req, { phone, userId: user.id, result: 'blocked', meta: { reason: 'account_disabled' } });
+    return res.status(403).json({ error: 'تم تعطيل هذا الحساب من الإدارة.' });
   }
   if (isPasswordBlocked(user)) {
     const retryAfterSeconds = Math.ceil((user.auth.loginBlockedUntil - Date.now()) / 1000);
@@ -781,7 +792,8 @@ app.post('/api/auth/register', authLimiter, requireOtpEnabled, validateBody(sche
       warranty: 0,
       jobsDone: 0,
       range: 25,
-      saved: []
+      saved: [],
+      createdAt: Date.now()
     };
     await users.insertOne(newUser);
     user = newUser;
@@ -803,9 +815,9 @@ app.post('/api/auth/refresh', authLimiter, validateBody(schemas.refresh), asyncR
   }
 
   const user = await cols().users.findOne({ id: stored.userId });
-  if (!user) {
+  if (!user || user.disabledAt) {
     await cols().refreshTokens.updateOne({ id: stored.id }, { $set: { revokedAt: new Date() } });
-    await logAudit('auth.refresh', req, { userId: stored.userId, result: 'failed', meta: { reason: 'missing_user' } });
+    await logAudit('auth.refresh', req, { userId: stored.userId, result: 'failed', meta: { reason: user ? 'account_disabled' : 'missing_user' } });
     return res.status(401).json({ error: 'جلسة الدخول غير صالحة.' });
   }
 
@@ -1180,6 +1192,17 @@ app.get('/api/reports', authenticate, asyncRoute(async (req, res) => {
 app.post('/api/upload', authenticate, upload.array('photos', 5), (req, res) => {
   res.json({ urls: req.files.map(f => `/uploads/${f.filename}`) });
 });
+
+app.use('/admin', createAdminDashboard({
+  secret: SECRET,
+  cols,
+  connect,
+  logAudit,
+  decryptSensitive,
+  hashResetCode,
+  createResetCode,
+  ipOf
+}));
 
 app.get('*', (req, res) => {
   const idx = path.join(__dirname, '../frontend/build/index.html');
