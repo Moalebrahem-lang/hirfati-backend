@@ -79,7 +79,7 @@ const demoPins = {
   '0991112233': '1234',
   '0944556677': '1234'
 };
-const adminBootstrapPin = process.env.ADMIN_BOOTSTRAP_PIN;
+const adminBootstrapPin = String(process.env.ADMIN_BOOTSTRAP_PIN || '').trim();
 
 function stripMongoId(doc) {
   if (!doc) return doc;

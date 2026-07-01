@@ -85,9 +85,18 @@ function createAdminDashboard({
       return null;
     }
   }
+  const normalizeAdminPin = value => String(value ?? '').trim();
+  const adminPinDebug = value => {
+    const normalized = normalizeAdminPin(value);
+    return {
+      present: normalized.length > 0,
+      length: normalized.length,
+      sha256Prefix: crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 10)
+    };
+  };
   function safeCompare(a, b) {
-    const aa = crypto.createHash('sha256').update(String(a || '')).digest();
-    const bb = crypto.createHash('sha256').update(String(b || '')).digest();
+    const aa = crypto.createHash('sha256').update(normalizeAdminPin(a)).digest();
+    const bb = crypto.createHash('sha256').update(normalizeAdminPin(b)).digest();
     return crypto.timingSafeEqual(aa, bb);
   }
 
@@ -320,12 +329,22 @@ function createAdminDashboard({
     res.send(renderLogin(req));
   });
   router.post('/login', adminLoginLimiter, async (req, res) => {
-    const configuredPin = process.env.ADMIN_BOOTSTRAP_PIN;
+    const configuredPin = normalizeAdminPin(process.env.ADMIN_BOOTSTRAP_PIN);
+    const receivedPin = normalizeAdminPin(req.body.pin);
+    console.log('Admin login PIN debug:', {
+      configured: adminPinDebug(configuredPin),
+      received: adminPinDebug(receivedPin),
+      ip: ipOf(req) || null
+    });
     if (!configuredPin) {
       await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_admin_bootstrap_pin' } });
       return res.status(503).send(renderLogin(req, 'ADMIN_BOOTSTRAP_PIN غير مضبوط في إعدادات الخادم.'));
     }
-    if (!safeCompare(req.body.pin, configuredPin)) {
+    if (!receivedPin) {
+      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_pin_input' } });
+      return res.status(400).send(renderLogin(req, 'أدخل PIN الإدارة.'));
+    }
+    if (!safeCompare(receivedPin, configuredPin)) {
       await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'wrong_pin' } });
       return res.status(401).send(renderLogin(req, 'PIN غير صحيح.'));
     }
