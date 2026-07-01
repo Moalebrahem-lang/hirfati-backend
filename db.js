@@ -79,7 +79,27 @@ const demoPins = {
   '0991112233': '1234',
   '0944556677': '1234'
 };
-const adminBootstrapPin = String(process.env.ADMIN_BOOTSTRAP_PIN || '').trim();
+const normalizeAdminPin = value => {
+  let normalized = String(value ?? '')
+    .replace(/^\uFEFF/, '')
+    .replace(/[\u200B-\u200D\u2060]/g, '')
+    .trim();
+  if (
+    normalized.length >= 2 &&
+    ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+      (normalized.startsWith("'") && normalized.endsWith("'")) ||
+      (normalized.startsWith('`') && normalized.endsWith('`')))
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  return normalized;
+};
+const adminBootstrapPin = normalizeAdminPin(
+  process.env.ADMIN_BOOTSTRAP_PIN ??
+  process.env.ADMIN_PIN ??
+  process.env.HIRFATI_ADMIN_PIN ??
+  ''
+);
 
 function stripMongoId(doc) {
   if (!doc) return doc;

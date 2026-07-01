@@ -85,7 +85,33 @@ function createAdminDashboard({
       return null;
     }
   }
-  const normalizeAdminPin = value => String(value ?? '').trim();
+  const normalizeAdminPin = value => {
+    let normalized = String(value ?? '')
+      .replace(/^\uFEFF/, '')
+      .replace(/[\u200B-\u200D\u2060]/g, '')
+      .trim();
+    if (
+      normalized.length >= 2 &&
+      ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+        (normalized.startsWith("'") && normalized.endsWith("'")) ||
+        (normalized.startsWith('`') && normalized.endsWith('`')))
+    ) {
+      normalized = normalized.slice(1, -1).trim();
+    }
+    return normalized;
+  };
+  const readConfiguredAdminPin = () => (
+    process.env.ADMIN_BOOTSTRAP_PIN ??
+    process.env.ADMIN_PIN ??
+    process.env.HIRFATI_ADMIN_PIN ??
+    ''
+  );
+  const readSubmittedAdminPin = body => (
+    body?.pin ??
+    body?.adminPin ??
+    body?.password ??
+    ''
+  );
   const adminPinDebug = value => {
     const normalized = normalizeAdminPin(value);
     return {
@@ -329,11 +355,20 @@ function createAdminDashboard({
     res.send(renderLogin(req));
   });
   router.post('/login', adminLoginLimiter, async (req, res) => {
-    const configuredPin = normalizeAdminPin(process.env.ADMIN_BOOTSTRAP_PIN);
-    const receivedPin = normalizeAdminPin(req.body.pin);
+    const rawConfiguredPin = readConfiguredAdminPin();
+    const rawReceivedPin = readSubmittedAdminPin(req.body);
+    const configuredPin = normalizeAdminPin(rawConfiguredPin);
+    const receivedPin = normalizeAdminPin(rawReceivedPin);
+    const pinsMatch = safeCompare(receivedPin, configuredPin);
     console.log('Admin login PIN debug:', {
       configured: adminPinDebug(configuredPin),
       received: adminPinDebug(receivedPin),
+      rawConfiguredPin,
+      rawReceivedPin,
+      normalizedConfiguredPin: configuredPin,
+      normalizedReceivedPin: receivedPin,
+      pinsMatch,
+      bodyKeys: Object.keys(req.body || {}),
       ip: ipOf(req) || null
     });
     if (!configuredPin) {
@@ -344,7 +379,7 @@ function createAdminDashboard({
       await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_pin_input' } });
       return res.status(400).send(renderLogin(req, 'أدخل PIN الإدارة.'));
     }
-    if (!safeCompare(receivedPin, configuredPin)) {
+    if (!pinsMatch) {
       await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'wrong_pin' } });
       return res.status(401).send(renderLogin(req, 'PIN غير صحيح.'));
     }
