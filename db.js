@@ -79,6 +79,7 @@ const demoPins = {
   '0991112233': '1234',
   '0944556677': '1234'
 };
+const adminBootstrapPin = process.env.ADMIN_BOOTSTRAP_PIN;
 
 function stripMongoId(doc) {
   if (!doc) return doc;
@@ -149,8 +150,9 @@ async function seedDemoUsers(db) {
         saved: user.saved
       }
     };
-    if (demoPins[user.phone]) {
-      update.$set.passwordHash = await bcrypt.hash(demoPins[user.phone], PASSWORD_BCRYPT_ROUNDS);
+    const bootstrapPin = demoPins[user.phone] || (user.role === 'admin' && adminBootstrapPin);
+    if (bootstrapPin) {
+      update.$set.passwordHash = await bcrypt.hash(bootstrapPin, PASSWORD_BCRYPT_ROUNDS);
       update.$set.passwordSetAt = Date.now();
       update.$set.recoveryQuestion = 'ما اسم المدرسة الأولى؟';
       update.$set.recoveryAnswerHash = await bcrypt.hash('تجريبي', PASSWORD_BCRYPT_ROUNDS);
