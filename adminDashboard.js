@@ -327,12 +327,6 @@ function createAdminDashboard({
   router.post('/login', adminLoginLimiter, async (req, res) => {
     const username = normalizeUsername(req.body.username);
     const password = normalizePassword(req.body.password);
-    console.log('Admin login DB debug:', {
-      username,
-      passwordLength: password.length,
-      bodyKeys: Object.keys(req.body || {}),
-      ip: ipOf(req) || null
-    });
     if (!username || !password) {
       await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_credentials' } });
       return res.status(400).send(renderLogin(req, 'أدخل اسم المستخدم وكلمة المرور.'));
@@ -343,7 +337,6 @@ function createAdminDashboard({
       return res.status(401).send(renderLogin(req, 'بيانات الدخول غير صحيحة.'));
     }
     const ok = await bcrypt.compare(password, admin.passwordHash);
-    console.log('Admin login DB compare:', { username, userFound: true, passwordMatches: ok });
     if (!ok || admin.disabledAt) {
       await logAudit('admin.login', req, { userId: admin.id, phone: admin.phone, result: 'failed', meta: { reason: admin.disabledAt ? 'admin_disabled' : 'wrong_password', username } });
       return res.status(401).send(renderLogin(req, 'بيانات الدخول غير صحيحة.'));

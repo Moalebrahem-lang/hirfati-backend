@@ -46,6 +46,7 @@ if (process.env.NODE_ENV === 'production' && SECRET === 'hirfati-secret-key-2024
 }
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false
