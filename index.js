@@ -1292,6 +1292,12 @@ app.use((err, req, res, next) => {
   if (err.code === 'EMAIL_SEND_FAILED') {
     return res.status(502).json({ error: 'تعذر إرسال البريد حالياً.' });
   }
+  if (err.code === 'WHATSAPP_NOT_CONFIGURED') {
+    return res.status(503).json({ error: 'خدمة واتساب غير مفعلة حالياً.' });
+  }
+  if (err.code === 'WHATSAPP_SEND_FAILED') {
+    return res.status(502).json({ error: 'تعذر إرسال رسالة واتساب حالياً.' });
+  }
   console.error(err);
   res.status(500).json({ error: 'حدث خطأ في الخادم.' });
 });
