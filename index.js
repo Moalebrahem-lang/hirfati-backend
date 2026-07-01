@@ -406,6 +406,93 @@ async function clearPasswordFailures(phone) {
   );
 }
 
+async function sendRealOtp(req, res, phone) {
+  const existingOtp = await cols().otps.findOne({ phone, purpose: 'login' });
+  const lastSentAt = existingOtp?.lastSentAt ? new Date(existingOtp.lastSentAt).getTime() : 0;
+  const retryAfterMs = OTP_RATE_LIMIT_MS - (Date.now() - lastSentAt);
+  if (retryAfterMs > 0) {
+    return res.status(429).json({
+      error: 'تم إرسال رمز مؤخراً. انتظر قليلاً قبل طلب رمز جديد.',
+      retryAfterSeconds: Math.ceil(retryAfterMs / 1000)
+    });
+  }
+
+  const otp = createOtp();
+  await cols().otps.updateOne(
+    { phone, purpose: 'login' },
+    {
+      $set: {
+        phone,
+        purpose: 'login',
+        hash: hashOtp(phone, otp),
+        attempts: 0,
+        expiresAt: new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000),
+        createdAt: new Date(),
+        lastSentAt: new Date()
+      }
+    },
+    { upsert: true }
+  );
+
+  try {
+    await sendOtp(phone, otp);
+  } catch (err) {
+    console.error('Twilio WhatsApp OTP failed:', {
+      status: err.status,
+      code: err.code,
+      message: err.message,
+      moreInfo: err.moreInfo
+    });
+    await logAudit('auth.otp.send', req, { phone, result: 'failed', meta: { reason: 'whatsapp_send_failed', code: err.code || null } });
+    return res.status(503).json({ error: 'تعذر إرسال رمز التحقق عبر واتساب حالياً.' });
+  }
+
+  await logAudit('auth.otp.send', req, { phone, result: 'success' });
+  return res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.', authMode: 'otp' });
+}
+
+async function handleOtpRequest(req, res, { legacy = false } = {}) {
+  const phone = normalizePhone(req.body.phone);
+  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+
+  if (ENABLE_OTP_AUTH) {
+    return sendRealOtp(req, res, phone);
+  }
+
+  const user = await cols().users.findOne({ phone });
+  await logAudit('auth.otp.compat', req, {
+    phone,
+    userId: user?.id || null,
+    result: 'password_required',
+    meta: { endpoint: legacy ? 'send-otp' : 'otp', userExists: Boolean(user), hasPassword: Boolean(user?.passwordHash) }
+  });
+
+  if (user?.passwordHash) {
+    return res.json({
+      message: 'هذا الحساب يستخدم تسجيل الدخول بالـ PIN.',
+      authMode: 'password',
+      requiresPin: true,
+      userExists: true
+    });
+  }
+
+  if (user && !user.passwordHash) {
+    return res.status(409).json({
+      error: 'هذا الحساب يحتاج إعداد PIN قبل تسجيل الدخول.',
+      authMode: 'password',
+      requiresPinSetup: true,
+      userExists: true
+    });
+  }
+
+  return res.json({
+    message: 'أنشئ حساباً جديداً واختر PIN لتسجيل الدخول.',
+    authMode: 'password',
+    needsRegistration: true,
+    userExists: false
+  });
+}
+
 app.get('/api/health', asyncRoute(async (req, res) => {
   const status = await healthCheck();
   res.status(status.ok ? 200 : 503).json(status);
@@ -622,51 +709,9 @@ app.post('/api/auth/password/recovery/identity/reset', authLimiter, validateBody
   res.json(await authPayload(user, req));
 }));
 
-app.post('/api/auth/otp', authLimiter, requireOtpEnabled, validateBody(schemas.otpRequest), asyncRoute(async (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
+app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute((req, res) => handleOtpRequest(req, res)));
 
-  const existingOtp = await cols().otps.findOne({ phone, purpose: 'login' });
-  const lastSentAt = existingOtp?.lastSentAt ? new Date(existingOtp.lastSentAt).getTime() : 0;
-  const retryAfterMs = OTP_RATE_LIMIT_MS - (Date.now() - lastSentAt);
-  if (retryAfterMs > 0) {
-    return res.status(429).json({
-      error: 'تم إرسال رمز مؤخراً. انتظر قليلاً قبل طلب رمز جديد.',
-      retryAfterSeconds: Math.ceil(retryAfterMs / 1000)
-    });
-  }
-
-  const otp = createOtp();
-  await cols().otps.updateOne(
-    { phone, purpose: 'login' },
-    {
-      $set: {
-        phone,
-        purpose: 'login',
-        hash: hashOtp(phone, otp),
-        attempts: 0,
-        expiresAt: new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000),
-        createdAt: new Date(),
-        lastSentAt: new Date()
-      }
-    },
-    { upsert: true }
-  );
-
-  try {
-    await sendOtp(phone, otp);
-  } catch (err) {
-    console.error('Twilio WhatsApp OTP failed:', {
-      status: err.status,
-      code: err.code,
-      message: err.message,
-      moreInfo: err.moreInfo
-    });
-    return res.status(503).json({ error: 'تعذر إرسال رمز التحقق عبر واتساب حالياً.' });
-  }
-
-  res.json({ message: 'تم إرسال رمز التحقق عبر واتساب.' });
-}));
+app.post('/api/auth/send-otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute((req, res) => handleOtpRequest(req, res, { legacy: true })));
 
 app.post('/api/auth/verify-otp', authLimiter, requireOtpEnabled, validateBody(schemas.otpVerify), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
