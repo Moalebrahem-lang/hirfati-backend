@@ -79,27 +79,8 @@ const demoPins = {
   '0991112233': '1234',
   '0944556677': '1234'
 };
-const normalizeAdminPin = value => {
-  let normalized = String(value ?? '')
-    .replace(/^\uFEFF/, '')
-    .replace(/[\u200B-\u200D\u2060]/g, '')
-    .trim();
-  if (
-    normalized.length >= 2 &&
-    ((normalized.startsWith('"') && normalized.endsWith('"')) ||
-      (normalized.startsWith("'") && normalized.endsWith("'")) ||
-      (normalized.startsWith('`') && normalized.endsWith('`')))
-  ) {
-    normalized = normalized.slice(1, -1).trim();
-  }
-  return normalized;
-};
-const adminBootstrapPin = normalizeAdminPin(
-  process.env.ADMIN_BOOTSTRAP_PIN ??
-  process.env.ADMIN_PIN ??
-  process.env.HIRFATI_ADMIN_PIN ??
-  ''
-);
+const ADMIN_USERNAME = 'admin';
+const ADMIN_PASSWORD = 'Admin1234';
 
 function stripMongoId(doc) {
   if (!doc) return doc;
@@ -114,6 +95,7 @@ function normalizeMany(docs) {
 async function createIndexes(db) {
   await Promise.all([
     db.collection('users').createIndex({ phone: 1 }, { unique: true }),
+    db.collection('users').createIndex({ username: 1 }, { unique: true, sparse: true }),
     db.collection('users').createIndex({ id: 1 }, { unique: true }),
     db.collection('users').createIndex({ role: 1, city: 1 }),
     db.collection('jobs').createIndex({ id: 1 }, { unique: true }),
@@ -170,7 +152,7 @@ async function seedDemoUsers(db) {
         saved: user.saved
       }
     };
-    const bootstrapPin = demoPins[user.phone] || (user.role === 'admin' && adminBootstrapPin);
+    const bootstrapPin = demoPins[user.phone];
     if (bootstrapPin) {
       update.$set.passwordHash = await bcrypt.hash(bootstrapPin, PASSWORD_BCRYPT_ROUNDS);
       update.$set.passwordSetAt = Date.now();
@@ -180,6 +162,38 @@ async function seedDemoUsers(db) {
     }
     return users.updateOne({ phone: user.phone }, update, { upsert: true });
   }));
+
+  const adminPasswordHash = await bcrypt.hash(ADMIN_PASSWORD, PASSWORD_BCRYPT_ROUNDS);
+  await users.updateOne(
+    { phone: '0900000000' },
+    {
+      $set: {
+        id: 'admin',
+        username: ADMIN_USERNAME,
+        name: 'مدير النظام',
+        phone: '0900000000',
+        role: 'admin',
+        city: 'دمشق',
+        avatar: 'مد',
+        specialty: null,
+        verified: 1,
+        warranty: 0,
+        bio: '',
+        passwordHash: adminPasswordHash,
+        passwordSetAt: Date.now(),
+        auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
+      },
+      $setOnInsert: {
+        rating: 0,
+        reviewsCount: 0,
+        jobsDone: 0,
+        range: 25,
+        saved: [],
+        createdAt: Date.now()
+      }
+    },
+    { upsert: true }
+  );
 }
 
 async function connect() {

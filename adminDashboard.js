@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const COOKIE_NAME = 'hirfati_admin_session';
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
@@ -85,46 +85,8 @@ function createAdminDashboard({
       return null;
     }
   }
-  const normalizeAdminPin = value => {
-    let normalized = String(value ?? '')
-      .replace(/^\uFEFF/, '')
-      .replace(/[\u200B-\u200D\u2060]/g, '')
-      .trim();
-    if (
-      normalized.length >= 2 &&
-      ((normalized.startsWith('"') && normalized.endsWith('"')) ||
-        (normalized.startsWith("'") && normalized.endsWith("'")) ||
-        (normalized.startsWith('`') && normalized.endsWith('`')))
-    ) {
-      normalized = normalized.slice(1, -1).trim();
-    }
-    return normalized;
-  };
-  const readConfiguredAdminPin = () => (
-    process.env.ADMIN_BOOTSTRAP_PIN ??
-    process.env.ADMIN_PIN ??
-    process.env.HIRFATI_ADMIN_PIN ??
-    ''
-  );
-  const readSubmittedAdminPin = body => (
-    body?.pin ??
-    body?.adminPin ??
-    body?.password ??
-    ''
-  );
-  const adminPinDebug = value => {
-    const normalized = normalizeAdminPin(value);
-    return {
-      present: normalized.length > 0,
-      length: normalized.length,
-      sha256Prefix: crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 10)
-    };
-  };
-  function safeCompare(a, b) {
-    const aa = crypto.createHash('sha256').update(normalizeAdminPin(a)).digest();
-    const bb = crypto.createHash('sha256').update(normalizeAdminPin(b)).digest();
-    return crypto.timingSafeEqual(aa, bb);
-  }
+  const normalizeUsername = value => String(value ?? '').trim().toLowerCase();
+  const normalizePassword = value => String(value ?? '').trim();
 
   async function ensureDb(req, res, next) {
     try {
@@ -189,10 +151,12 @@ function createAdminDashboard({
       title: 'تسجيل دخول الإدارة',
       active: '',
       content: `<div class="login"><form class="login-card" method="post" action="/admin/login">
-        <div class="brand"><div class="logo">ح</div><div><h1>دخول الإدارة</h1><p class="muted">أدخل ADMIN_BOOTSTRAP_PIN للمتابعة</p></div></div>
+        <div class="brand"><div class="logo">ح</div><div><h1>دخول الإدارة</h1><p class="muted">أدخل اسم المستخدم وكلمة المرور</p></div></div>
         ${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}
-        <label>PIN الإدارة</label>
-        <input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required autofocus>
+        <label>اسم المستخدم</label>
+        <input name="username" autocomplete="username" required autofocus value="admin">
+        <label style="display:block;margin-top:12px">كلمة المرور</label>
+        <input name="password" type="password" autocomplete="current-password" required>
         <button style="width:100%;margin-top:14px">دخول آمن</button>
       </form></div>`
     });
@@ -355,36 +319,31 @@ function createAdminDashboard({
     res.send(renderLogin(req));
   });
   router.post('/login', adminLoginLimiter, async (req, res) => {
-    const rawConfiguredPin = readConfiguredAdminPin();
-    const rawReceivedPin = readSubmittedAdminPin(req.body);
-    const configuredPin = normalizeAdminPin(rawConfiguredPin);
-    const receivedPin = normalizeAdminPin(rawReceivedPin);
-    const pinsMatch = safeCompare(receivedPin, configuredPin);
-    console.log('Admin login PIN debug:', {
-      configured: adminPinDebug(configuredPin),
-      received: adminPinDebug(receivedPin),
-      rawConfiguredPin,
-      rawReceivedPin,
-      normalizedConfiguredPin: configuredPin,
-      normalizedReceivedPin: receivedPin,
-      pinsMatch,
+    const username = normalizeUsername(req.body.username);
+    const password = normalizePassword(req.body.password);
+    console.log('Admin login DB debug:', {
+      username,
+      passwordLength: password.length,
       bodyKeys: Object.keys(req.body || {}),
       ip: ipOf(req) || null
     });
-    if (!configuredPin) {
-      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_admin_bootstrap_pin' } });
-      return res.status(503).send(renderLogin(req, 'ADMIN_BOOTSTRAP_PIN غير مضبوط في إعدادات الخادم.'));
+    if (!username || !password) {
+      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_credentials' } });
+      return res.status(400).send(renderLogin(req, 'أدخل اسم المستخدم وكلمة المرور.'));
     }
-    if (!receivedPin) {
-      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_pin_input' } });
-      return res.status(400).send(renderLogin(req, 'أدخل PIN الإدارة.'));
+    const admin = await cols().users.findOne({ username, role: 'admin' });
+    if (!admin?.passwordHash) {
+      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'missing_admin_user', username } });
+      return res.status(401).send(renderLogin(req, 'بيانات الدخول غير صحيحة.'));
     }
-    if (!pinsMatch) {
-      await logAudit('admin.login', req, { result: 'failed', meta: { reason: 'wrong_pin' } });
-      return res.status(401).send(renderLogin(req, 'PIN غير صحيح.'));
+    const ok = await bcrypt.compare(password, admin.passwordHash);
+    console.log('Admin login DB compare:', { username, userFound: true, passwordMatches: ok });
+    if (!ok || admin.disabledAt) {
+      await logAudit('admin.login', req, { userId: admin.id, phone: admin.phone, result: 'failed', meta: { reason: admin.disabledAt ? 'admin_disabled' : 'wrong_password', username } });
+      return res.status(401).send(renderLogin(req, 'بيانات الدخول غير صحيحة.'));
     }
-    setSessionCookie(res, signSession(req));
-    await logAudit('admin.login', req, { result: 'success' });
+    setSessionCookie(res, signSession(req, admin));
+    await logAudit('admin.login', req, { userId: admin.id, phone: admin.phone, result: 'success' });
     res.redirect('/admin');
   });
   router.post('/logout', (req, res) => {
