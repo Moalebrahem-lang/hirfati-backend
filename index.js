@@ -47,13 +47,13 @@ app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false
 }));
-app.use(cors({
+const corsOptions = {
   origin(origin, cb) {
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('CORS origin is not allowed.'));
   },
   credentials: true
-}));
+};
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 const hasNoSqlOperator = value => {
@@ -97,6 +97,7 @@ const requireOtpEnabled = (req, res, next) => {
   if (!ENABLE_OTP_AUTH) return res.status(410).json({ error: 'تسجيل الدخول عبر OTP غير مفعّل حالياً.' });
   next();
 };
+app.use('/api', cors(corsOptions));
 app.use('/api', apiLimiter);
 app.use('/api', rejectUnsafeInput);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
