@@ -13,6 +13,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { connect, cols, stripMongoId, normalizeMany, healthCheck } = require('./db');
 const { sendOtp } = require('./sms');
+const { sendVerificationEmail } = require('./email');
 const createAdminDashboard = require('./adminDashboard');
 
 const app = express();
@@ -25,13 +26,15 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:8100'
 ];
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || DEFAULT_ALLOWED_ORIGINS.join(','))
+const configuredOrigins = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || '')
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);
+const ALLOWED_ORIGINS = [...new Set([...DEFAULT_ALLOWED_ORIGINS, ...configuredOrigins])];
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 5);
 const OTP_RATE_LIMIT_MS = Number(process.env.OTP_RATE_LIMIT_MS || 60 * 1000);
 const ENABLE_OTP_AUTH = process.env.ENABLE_OTP_AUTH === 'true';
+const EMAIL_CODE_TTL_MINUTES = Number(process.env.EMAIL_CODE_TTL_MINUTES || 10);
 const PASSWORD_LOCK_MS = Number(process.env.PASSWORD_LOCK_MS || 15 * 60 * 1000);
 const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTEMPTS || 5);
 const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
@@ -142,6 +145,11 @@ const hashResetCode = (phone, code) => crypto
   .createHash('sha256')
   .update(`${normalizePhone(phone)}:${String(code || '').toUpperCase()}:${SECRET}`)
   .digest('hex');
+const createEmailCode = () => String(crypto.randomInt(100000, 1000000));
+const hashEmailCode = (userId, code) => crypto
+  .createHash('sha256')
+  .update(`${userId}:${String(code || '').replace(/\D/g, '')}:${SECRET}`)
+  .digest('hex');
 const signAuthToken = user => jwt.sign({ id: user.id, role: user.role, type: 'access' }, SECRET, { expiresIn: ACCESS_TOKEN_TTL });
 const hashRefreshToken = token => crypto.createHash('sha256').update(`${token}:${SECRET}`).digest('hex');
 const encryptSensitive = value => {
@@ -175,6 +183,7 @@ const publicUser = user => {
   delete clean.auth;
   delete clean.recoveryEmail;
   delete clean.recoveryEmailEnc;
+  delete clean.emailVerification;
   return clean;
 };
 const isValidPin = pin => /^\d{4,6}$/.test(String(pin || ''));
@@ -203,6 +212,8 @@ const schemas = {
   passwordLogin: Joi.object({ phone: phoneSchema, pin: pinSchema }),
   recoveryStart: Joi.object({ phone: phoneSchema }),
   recoveryVerify: Joi.object({ phone: phoneSchema, recoveryAnswer: safeText(120).required(), newPin: pinSchema }),
+  emailVerificationRequest: Joi.object({ email: Joi.string().trim().email().max(160).required() }),
+  emailVerificationConfirm: Joi.object({ code: Joi.string().trim().pattern(/^\d{6}$/).required() }),
   otpRequest: Joi.object({ phone: phoneSchema }),
   otpVerify: Joi.object({ phone: phoneSchema, otp: Joi.string().trim().pattern(/^\d{4}$/).required() }),
   legacyRegister: Joi.object({
@@ -723,6 +734,65 @@ app.post('/api/auth/password/recovery/identity/reset', authLimiter, validateBody
   res.json(await authPayload(user, req));
 }));
 
+app.post('/api/auth/email/verification/request', authLimiter, authenticate, validateBody(schemas.emailVerificationRequest), asyncRoute(async (req, res) => {
+  const email = String(req.body.email).trim().toLowerCase();
+  const user = await cols().users.findOne({ id: req.user.id });
+  if (!user) return res.status(404).json({ error: 'غير موجود.' });
+
+  const code = createEmailCode();
+  await sendVerificationEmail(email, code);
+
+  await cols().users.updateOne(
+    { id: req.user.id },
+    {
+      $set: {
+        recoveryEmailEnc: encryptSensitive(email),
+        emailVerification: {
+          hash: hashEmailCode(req.user.id, code),
+          expiresAt: Date.now() + EMAIL_CODE_TTL_MINUTES * 60 * 1000,
+          attempts: 0,
+          requestedAt: Date.now()
+        },
+        emailVerifiedAt: null
+      }
+    }
+  );
+  await logAudit('auth.email_verification.requested', req, { userId: req.user.id, phone: user.phone, result: 'sent' });
+  res.json({ success: true, message: 'تم إرسال رمز التحقق إلى البريد الاحتياطي.' });
+}));
+
+app.post('/api/auth/email/verification/confirm', authLimiter, authenticate, validateBody(schemas.emailVerificationConfirm), asyncRoute(async (req, res) => {
+  const user = await cols().users.findOne({ id: req.user.id });
+  const verification = user?.emailVerification;
+  if (!verification?.hash || !verification?.expiresAt) {
+    await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, result: 'failed', meta: { reason: 'missing_code' } });
+    return res.status(404).json({ error: 'لا يوجد رمز تحقق نشط.' });
+  }
+  if (verification.expiresAt < Date.now()) {
+    await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, phone: user.phone, result: 'failed', meta: { reason: 'expired' } });
+    return res.status(400).json({ error: 'انتهت صلاحية رمز التحقق.' });
+  }
+  if ((verification.attempts || 0) >= 5) {
+    await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, phone: user.phone, result: 'blocked', meta: { reason: 'too_many_attempts' } });
+    return res.status(429).json({ error: 'محاولات كثيرة. اطلب رمزاً جديداً.' });
+  }
+  if (verification.hash !== hashEmailCode(req.user.id, req.body.code)) {
+    await cols().users.updateOne({ id: req.user.id }, { $inc: { 'emailVerification.attempts': 1 } });
+    await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, phone: user.phone, result: 'failed', meta: { reason: 'wrong_code' } });
+    return res.status(401).json({ error: 'رمز التحقق غير صحيح.' });
+  }
+
+  await cols().users.updateOne(
+    { id: req.user.id },
+    {
+      $set: { emailVerifiedAt: Date.now() },
+      $unset: { emailVerification: '' }
+    }
+  );
+  await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, phone: user.phone, result: 'success' });
+  res.json({ success: true, message: 'تم تأكيد البريد الاحتياطي.' });
+}));
+
 app.post('/api/auth/otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute((req, res) => handleOtpRequest(req, res)));
 
 app.post('/api/auth/send-otp', authLimiter, validateBody(schemas.otpRequest), asyncRoute((req, res) => handleOtpRequest(req, res, { legacy: true })));
@@ -1214,6 +1284,12 @@ app.get('*', (req, res) => {
 app.use((err, req, res, next) => {
   if (err.message === 'CORS origin is not allowed.') {
     return res.status(403).json({ error: 'المصدر غير مسموح.' });
+  }
+  if (err.code === 'EMAIL_NOT_CONFIGURED') {
+    return res.status(503).json({ error: 'خدمة البريد غير مفعلة حالياً.' });
+  }
+  if (err.code === 'EMAIL_SEND_FAILED') {
+    return res.status(502).json({ error: 'تعذر إرسال البريد حالياً.' });
   }
   console.error(err);
   res.status(500).json({ error: 'حدث خطأ في الخادم.' });

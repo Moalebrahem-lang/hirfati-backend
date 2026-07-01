@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.MONGODB_DB || 'hirfati';
@@ -80,7 +81,6 @@ const demoPins = {
   '0944556677': '1234'
 };
 const ADMIN_USERNAME = 'admin';
-const ADMIN_PASSWORD = 'Admin1234';
 
 function stripMongoId(doc) {
   if (!doc) return doc;
@@ -163,7 +163,8 @@ async function seedDemoUsers(db) {
     return users.updateOne({ phone: user.phone }, update, { upsert: true });
   }));
 
-  const adminPasswordHash = await bcrypt.hash(ADMIN_PASSWORD, PASSWORD_BCRYPT_ROUNDS);
+  const existingAdmin = await users.findOne({ phone: '0900000000' });
+  const adminPasswordHash = existingAdmin?.passwordHash || await bcrypt.hash(crypto.randomBytes(32).toString('base64url'), PASSWORD_BCRYPT_ROUNDS);
   await users.updateOne(
     { phone: '0900000000' },
     {
@@ -179,11 +180,12 @@ async function seedDemoUsers(db) {
         verified: 1,
         warranty: 0,
         bio: '',
-        passwordHash: adminPasswordHash,
-        passwordSetAt: Date.now(),
         auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
       },
       $setOnInsert: {
+        passwordHash: adminPasswordHash,
+        passwordSetAt: Date.now(),
+        adminPasswordNeedsReset: true,
         rating: 0,
         reviewsCount: 0,
         jobsDone: 0,
