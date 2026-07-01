@@ -167,6 +167,8 @@ const publicUser = user => {
   const clean = stripMongoId(user);
   delete clean.passwordHash;
   delete clean.recoveryAnswerHash;
+  delete clean.recoveryQuestion;
+  delete clean.passwordSetAt;
   delete clean.auth;
   delete clean.recoveryEmail;
   delete clean.recoveryEmailEnc;
@@ -181,7 +183,7 @@ const optionalText = (max = 200) => Joi.string().trim().allow('', null).max(max)
 const phoneSchema = Joi.string().trim().min(7).max(24).pattern(/^[+\d\s().-]+$/).required();
 const pinSchema = Joi.string().trim().pattern(/^\d{4,6}$/).required();
 const idSchema = Joi.string().trim().min(2).max(40).pattern(/^[A-Za-z0-9_-]+$/);
-const imageSchema = Joi.string().max(8 * 1024 * 1024);
+const imageSchema = Joi.string().trim().max(8 * 1024 * 1024).pattern(/^(data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+|\/uploads\/[A-Za-z0-9_.-]+)$/);
 const identityImageSchema = Joi.string().trim().max(6 * 1024 * 1024).pattern(/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/).required();
 const schemas = {
   passwordRegister: Joi.object({
@@ -1011,6 +1013,8 @@ app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), a
   const job = await cols().jobs.findOne({ id: jobId });
   if (!job) return res.status(404).json({ error: 'الطلب غير موجود.' });
   if (job.clientId === req.user.id) return res.status(403).json({ error: 'لا يمكنك إرسال عرض على طلبك.' });
+  const existingInterest = await cols().interests.findOne({ jobId, craftsmanId: req.user.id });
+  if (existingInterest) return res.status(409).json({ error: 'أرسلت عرضاً لهذا الطلب مسبقاً.' });
   const interest = {
     id: id('i'),
     jobId,

@@ -76,7 +76,8 @@ const demoUsers = [
 ];
 
 const demoPins = {
-  '0991112233': '1234'
+  '0991112233': '1234',
+  '0944556677': '1234'
 };
 
 function stripMongoId(doc) {
