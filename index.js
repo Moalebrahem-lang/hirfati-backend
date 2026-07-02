@@ -1580,7 +1580,7 @@ async function runEngagementTriggers() {
 }
 
 function startEngagementRunner() {
-  if (process.env.ENGAGEMENT_TRIGGERS_ENABLED === 'false') return;
+  if (process.env.ENGAGEMENT_TRIGGERS_ENABLED !== 'true') return;
   const run = () => runEngagementTriggers().catch(err => console.error('Engagement triggers failed:', err.message));
   setTimeout(run, 30 * 1000);
   setInterval(run, ENGAGEMENT_INTERVAL_MS);
