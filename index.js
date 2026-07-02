@@ -23,6 +23,7 @@ const SECRET = process.env.JWT_SECRET || 'hirfati-secret-key-2024';
 const DEFAULT_ALLOWED_ORIGINS = [
   'https://hirfati-backend-production.up.railway.app',
   'capacitor://localhost',
+  'https://localhost',
   'http://localhost',
   'http://localhost:3000',
   'http://localhost:8100'
