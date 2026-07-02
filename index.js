@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const { connect, cols, stripMongoId, normalizeMany, healthCheck } = require('./db');
 const { sendOtp } = require('./sms');
 const { sendVerificationEmail } = require('./email');
+const { pushStatus, sendToTokens } = require('./push');
 const createAdminDashboard = require('./adminDashboard');
 
 const app = express();
@@ -40,6 +41,7 @@ const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTE
 const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '20m';
 const REFRESH_TOKEN_DAYS = Number(process.env.REFRESH_TOKEN_DAYS || 7);
+const ENGAGEMENT_INTERVAL_MS = Number(process.env.ENGAGEMENT_INTERVAL_MS || 15 * 60 * 1000);
 if (process.env.NODE_ENV === 'production' && SECRET === 'hirfati-secret-key-2024') {
   throw new Error('JWT_SECRET must be set to a strong secret in production.');
 }
@@ -299,6 +301,18 @@ const schemas = {
   logout: Joi.object({
     refreshToken: Joi.string().trim().min(40).max(300)
   }),
+  deviceToken: Joi.object({
+    token: Joi.string().trim().min(20).max(4096).required(),
+    platform: Joi.string().valid('ios', 'android', 'web', 'unknown').default('unknown'),
+    deviceId: optionalText(120)
+  }),
+  campaign: Joi.object({
+    title: safeText(90).required(),
+    text: safeText(240).required(),
+    target: Joi.string().valid('all', 'clients', 'craftsmen', 'city_craftsmen', 'city_clients').required(),
+    city: optionalText(60),
+    specialty: optionalText(80)
+  }),
   identitySubmit: Joi.object({
     idCardImage: identityImageSchema,
     selfieImage: identityImageSchema,
@@ -397,8 +411,9 @@ async function authPayload(user, req) {
 }
 
 async function addNotif(userId, type, text, jobId) {
+  const notificationId = id('n');
   await cols().notifications.insertOne({
-    id: id('n'),
+    id: notificationId,
     userId,
     type,
     text,
@@ -406,6 +421,139 @@ async function addNotif(userId, type, text, jobId) {
     at: Date.now(),
     read: 0
   });
+  await sendPushToUsers([userId], {
+    title: 'حرفتي',
+    body: text,
+    data: { type, jobId: jobId || '', notificationId }
+  });
+  return notificationId;
+}
+
+async function sendPushToUsers(userIds, payload) {
+  const targetIds = [...new Set((userIds || []).filter(Boolean))];
+  if (!targetIds.length) return { successCount: 0, failureCount: 0, disabled: false };
+  const tokens = await cols().deviceTokens.find({
+    userId: { $in: targetIds },
+    disabledAt: null
+  }).project({ token: 1 }).toArray();
+  const result = await sendToTokens(tokens.map(item => item.token), payload);
+  if (result.responses?.length) {
+    const failedTokens = result.responses
+      .map((response, index) => response.success ? null : tokens[index]?.token)
+      .filter(Boolean);
+    if (failedTokens.length) {
+      await cols().deviceTokens.updateMany(
+        { token: { $in: failedTokens } },
+        { $set: { disabledAt: Date.now(), disabledReason: 'fcm_send_failed' } }
+      );
+    }
+  }
+  return result;
+}
+
+async function addBulkNotifications(userIds, type, text, jobId, pushPayload = {}) {
+  const targetIds = [...new Set((userIds || []).filter(Boolean))];
+  if (!targetIds.length) return { inserted: 0, push: { successCount: 0, failureCount: 0 } };
+  const docs = targetIds.map(userId => ({
+    id: id('n'),
+    userId,
+    type,
+    text,
+    jobId: jobId || null,
+    at: Date.now(),
+    read: 0
+  }));
+  await cols().notifications.insertMany(docs, { ordered: false });
+  const push = await sendPushToUsers(targetIds, {
+    title: pushPayload.title || 'حرفتي',
+    body: pushPayload.body || text,
+    data: { type, jobId: jobId || '', ...(pushPayload.data || {}) }
+  });
+  return { inserted: docs.length, push };
+}
+
+async function createEngagementOnce(key, type, userId, text, meta = {}) {
+  const event = {
+    id: id('eng'),
+    key,
+    type,
+    userId,
+    meta,
+    createdAt: Date.now()
+  };
+  try {
+    await cols().engagementEvents.insertOne(event);
+    await addNotif(userId, type, text, meta.jobId || null);
+    return true;
+  } catch (err) {
+    if (err.code === 11000) return false;
+    throw err;
+  }
+}
+
+function campaignFilter({ target, city, specialty }) {
+  const active = { $or: [{ disabledAt: { $exists: false } }, { disabledAt: null }] };
+  const filters = [active];
+  if (target === 'clients') filters.push({ role: 'client' });
+  if (target === 'craftsmen') filters.push({ role: 'craftsman' });
+  if (target === 'city_craftsmen') filters.push({ role: 'craftsman', city });
+  if (target === 'city_clients') filters.push({ role: 'client', city });
+  if (specialty) filters.push({ specialty });
+  return filters.length === 1 ? active : { $and: filters };
+}
+
+async function sendAdminCampaign({ title, text, target, city, specialty }, req) {
+  const { value, error } = schemas.campaign.validate({ title, text, target, city, specialty }, {
+    abortEarly: false,
+    stripUnknown: true,
+    convert: true
+  });
+  if (error) {
+    const err = new Error('تحقق من بيانات الحملة.');
+    err.status = 400;
+    throw err;
+  }
+  ({ title, text, target, city, specialty } = value);
+  if (hasSuspiciousString({ title, text, city, specialty })) {
+    const err = new Error('محتوى الحملة يحتوي نصاً غير آمن.');
+    err.status = 400;
+    throw err;
+  }
+  if ((target === 'city_craftsmen' || target === 'city_clients') && !city) {
+    const err = new Error('اختر المدينة لهذا النوع من الاستهداف.');
+    err.status = 400;
+    throw err;
+  }
+  const filter = campaignFilter({ target, city, specialty });
+  const users = await cols().users.find(filter).project({ id: 1 }).limit(5000).toArray();
+  const result = await addBulkNotifications(
+    users.map(user => user.id),
+    'campaign',
+    text,
+    null,
+    { title, body: text, data: { campaign: 'manual', target } }
+  );
+  const campaign = {
+    id: id('camp'),
+    title,
+    text,
+    target,
+    city: city || null,
+    specialty: specialty || null,
+    recipients: users.length,
+    pushSuccess: result.push?.successCount || 0,
+    pushFailure: result.push?.failureCount || 0,
+    createdBy: req?.user?.id || 'admin-dashboard',
+    createdAt: Date.now()
+  };
+  await cols().campaigns.insertOne(campaign);
+  await logAudit('admin.campaign.sent', req || { headers: {} }, {
+    userId: req?.user?.id || null,
+    result: 'success',
+    targetId: campaign.id,
+    meta: { target, city: city || null, specialty: specialty || null, recipients: users.length }
+  });
+  return { campaign, result };
 }
 
 async function logRecoveryAttempt(phone, result, reason, req) {
@@ -1062,6 +1210,11 @@ app.put('/api/admin/identity-requests/:id/status', authenticate, requireVerified
   res.json({ success: true, resetCode });
 }));
 
+app.post('/api/admin/campaigns', authenticate, requireVerifiedEmail, requireAdmin, validateBody(schemas.campaign), asyncRoute(async (req, res) => {
+  const { campaign } = await sendAdminCampaign(req.body, req);
+  res.json({ success: true, campaign });
+}));
+
 // --- JOBS ---
 app.get('/api/jobs', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   const filter = req.user.role === 'admin'
@@ -1094,6 +1247,21 @@ app.post('/api/jobs', authenticate, requireVerifiedEmail, validateBody(schemas.j
     cancelReason: null
   };
   await cols().jobs.insertOne(job);
+  const craftsmen = await cols().users.find({
+    role: 'craftsman',
+    disabledAt: null,
+    $and: [
+      { $or: [{ city }, { serviceAreas: city }] },
+      { $or: [{ specialty: category }, { specialty: null }] }
+    ]
+  }).project({ id: 1 }).limit(100).toArray();
+  await addBulkNotifications(
+    craftsmen.map(user => user.id),
+    'new_job',
+    `طلب جديد في ${category}: ${title.slice(0, 50)}`,
+    job.id,
+    { title: 'طلب جديد مناسب لك', body: `${category} في ${area || city}` }
+  );
   res.json({ id: job.id });
 }));
 
@@ -1229,6 +1397,35 @@ app.post('/api/messages', authenticate, requireVerifiedEmail, validateBody(schem
 }));
 
 // --- NOTIFICATIONS ---
+app.get('/api/notifications/push/status', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
+  res.json(pushStatus());
+}));
+
+app.post('/api/notifications/device-token', authenticate, requireVerifiedEmail, validateBody(schemas.deviceToken), asyncRoute(async (req, res) => {
+  const now = Date.now();
+  await cols().deviceTokens.updateOne(
+    { token: req.body.token },
+    {
+      $set: {
+        userId: req.user.id,
+        token: req.body.token,
+        platform: req.body.platform || 'unknown',
+        deviceId: req.body.deviceId || null,
+        updatedAt: now,
+        disabledAt: null,
+        disabledReason: null
+      },
+      $setOnInsert: {
+        id: id('dt'),
+        createdAt: now
+      }
+    },
+    { upsert: true }
+  );
+  await logAudit('notifications.device_token.registered', req, { userId: req.user.id, result: 'success', meta: { platform: req.body.platform || 'unknown' } });
+  res.json({ success: true, push: pushStatus() });
+}));
+
 app.get('/api/notifications', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   const notifications = await cols().notifications.find({
     userId: { $in: [req.user.id, 'all'] }
@@ -1281,6 +1478,9 @@ app.post('/api/reviews', authenticate, requireVerifiedEmail, validateBody(schema
     { $set: { rating: Math.round(stat.avg * 10) / 10, reviewsCount: stat.count }, $inc: { jobsDone: 1 } }
   );
   await addNotif(craftsmanId, 'review', `حصلت على تقييم ${rating} نجوم!`, null);
+  if (rating === 5) {
+    await addNotif(req.user.id, 'share_prompt', 'شكراً على تقييمك! إذا أعجبتك التجربة شارك حرفتي مع شخص يحتاج حرفي موثوق.', null);
+  }
   res.json({ id: review.id });
 }));
 
@@ -1310,6 +1510,82 @@ app.post('/api/upload', authenticate, requireVerifiedEmail, upload.array('photos
   res.json({ urls: req.files.map(f => `/uploads/${f.filename}`) });
 });
 
+async function runEngagementTriggers() {
+  const now = Date.now();
+  const threeDaysAgo = now - 3 * 24 * 60 * 60 * 1000;
+  const oneHourAgo = now - 60 * 60 * 1000;
+
+  const inactiveClients = await cols().users.find({
+    role: 'client',
+    emailVerificationRequired: { $ne: true },
+    disabledAt: null,
+    $or: [
+      { lastNoJobReminderAt: { $exists: false } },
+      { lastNoJobReminderAt: { $lt: threeDaysAgo } }
+    ],
+    $expr: {
+      $lt: [
+        { $ifNull: ['$createdAt', '$passwordSetAt'] },
+        threeDaysAgo
+      ]
+    }
+  }).project({ id: 1, name: 1 }).limit(100).toArray();
+
+  for (const user of inactiveClients) {
+    const hasJob = await cols().jobs.findOne({ clientId: user.id }, { projection: { id: 1 } });
+    if (!hasJob) {
+      const sent = await createEngagementOnce(
+        `client_no_job:${user.id}:${new Date(now).toISOString().slice(0, 10)}`,
+        'client_no_job_reminder',
+        user.id,
+        'جاهز تبدأ؟ أضف طلبك الأول وسنوصلك بحرفيين مناسبين في مدينتك.',
+        {}
+      );
+      if (sent) await cols().users.updateOne({ id: user.id }, { $set: { lastNoJobReminderAt: now } });
+    }
+  }
+
+  const pendingJobs = await cols().jobs.find({
+    status: 'open',
+    createdAt: { $lt: oneHourAgo },
+    $or: [
+      { lastCraftsmanReminderAt: { $exists: false } },
+      { lastCraftsmanReminderAt: { $lt: oneHourAgo } }
+    ]
+  }).sort({ createdAt: -1 }).limit(100).toArray();
+
+  for (const job of pendingJobs) {
+    const interested = await cols().interests.distinct('craftsmanId', { jobId: job.id });
+    const craftsmen = await cols().users.find({
+      role: 'craftsman',
+      id: { $nin: interested },
+      $and: [
+        { $or: [{ city: job.city }, { serviceAreas: job.city }] },
+        { $or: [{ specialty: job.category }, { specialty: null }] }
+      ],
+      disabledAt: null
+    }).project({ id: 1 }).limit(50).toArray();
+    const ids = craftsmen.map(user => user.id);
+    if (ids.length) {
+      await addBulkNotifications(
+        ids,
+        'craftsman_pending_job',
+        `تذكير: طلب ${job.category} ينتظر عرضك في ${job.area || job.city}.`,
+        job.id,
+        { title: 'طلب ينتظر ردك', body: `${job.category} في ${job.area || job.city}` }
+      );
+      await cols().jobs.updateOne({ id: job.id }, { $set: { lastCraftsmanReminderAt: now } });
+    }
+  }
+}
+
+function startEngagementRunner() {
+  if (process.env.ENGAGEMENT_TRIGGERS_ENABLED === 'false') return;
+  const run = () => runEngagementTriggers().catch(err => console.error('Engagement triggers failed:', err.message));
+  setTimeout(run, 30 * 1000);
+  setInterval(run, ENGAGEMENT_INTERVAL_MS);
+}
+
 app.use('/admin', createAdminDashboard({
   secret: SECRET,
   cols,
@@ -1318,7 +1594,9 @@ app.use('/admin', createAdminDashboard({
   decryptSensitive,
   hashResetCode,
   createResetCode,
-  ipOf
+  ipOf,
+  sendAdminCampaign,
+  pushStatus
 }));
 
 app.get('*', (req, res) => {
@@ -1350,6 +1628,9 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 حِرفتي running on port ${PORT}`);
   connect()
-    .then(() => console.log('✅ MongoDB connected'))
+    .then(() => {
+      console.log('✅ MongoDB connected');
+      startEngagementRunner();
+    })
     .catch(err => console.error('MongoDB connection failed:', err.message));
 });

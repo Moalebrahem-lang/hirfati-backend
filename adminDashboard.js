@@ -14,7 +14,9 @@ function createAdminDashboard({
   decryptSensitive,
   hashResetCode,
   createResetCode,
-  ipOf
+  ipOf,
+  sendAdminCampaign,
+  pushStatus
 }) {
   const router = express.Router();
   const adminLoginLimiter = rateLimit({
@@ -113,7 +115,8 @@ function createAdminDashboard({
       ['/admin', 'الرئيسية'],
       ['/admin/users', 'المستخدمون'],
       ['/admin/verifications', 'التحقق من الهوية'],
-      ['/admin/security', 'الأمان']
+      ['/admin/security', 'الأمان'],
+      ['/admin/engagement', 'التفاعل']
     ].map(([href, label]) => `<a class="${active === href ? 'on' : ''}" href="${href}">${label}</a>`).join('');
     return `<!doctype html>
 <html lang="ar" dir="rtl">
@@ -319,6 +322,62 @@ function createAdminDashboard({
     }));
   }
 
+  async function renderEngagement(req, res, flash = '') {
+    const [campaigns, clientCount, craftsmanCount] = await Promise.all([
+      cols().campaigns.find({}).sort({ createdAt: -1 }).limit(25).toArray(),
+      cols().users.countDocuments({ role: 'client', disabledAt: null }),
+      cols().users.countDocuments({ role: 'craftsman', disabledAt: null })
+    ]);
+    const status = pushStatus ? pushStatus() : { configured: false };
+    const rows = campaigns.map(c => `<tr>
+      <td><strong>${escapeHtml(c.title)}</strong><br><span class="muted">${escapeHtml(c.text)}</span></td>
+      <td>${escapeHtml(c.target)}${c.city ? `<br><span class="muted">${escapeHtml(c.city)}</span>` : ''}</td>
+      <td>${escapeHtml(c.recipients || 0)}</td>
+      <td>${escapeHtml(c.pushSuccess || 0)} / ${escapeHtml(c.pushFailure || 0)}</td>
+      <td>${fmtDate(c.createdAt)}</td>
+    </tr>`).join('');
+    res.send(renderShell(req, {
+      title: 'التفاعل',
+      active: '/admin/engagement',
+      content: `${pageHeader('التفاعل والإشعارات', 'إرسال عروض ورسائل يدوية مع الاحتفاظ بالإشعارات الداخلية وFCM')}
+        ${flash ? `<section class="panel highlight"><strong>${escapeHtml(flash)}</strong></section>` : ''}
+        <section class="grid stats" style="margin-bottom:16px">
+          <div class="stat"><b>${clientCount}</b><span>عملاء نشطون</span></div>
+          <div class="stat"><b>${craftsmanCount}</b><span>حرفيون نشطون</span></div>
+          <div class="stat"><b>${status.configured ? 'مفعل' : 'غير مفعل'}</b><span>Firebase Push</span></div>
+          <div class="stat"><b>${campaigns.length}</b><span>آخر الحملات</span></div>
+        </section>
+        <section class="grid two">
+          <form class="panel" method="post" action="/admin/engagement/send">
+            <h2>إرسال رسالة جماعية</h2>
+            <label>العنوان</label>
+            <input name="title" maxlength="90" required placeholder="مثلاً: عرض خاص هذا الأسبوع">
+            <label style="display:block;margin-top:12px">نص الرسالة</label>
+            <textarea name="text" maxlength="240" required placeholder="اكتب رسالة قصيرة وواضحة"></textarea>
+            <label style="display:block;margin-top:12px">الفئة</label>
+            <select name="target" required>
+              <option value="all">كل المستخدمين</option>
+              <option value="clients">كل العملاء</option>
+              <option value="craftsmen">كل الحرفيين</option>
+              <option value="city_clients">عملاء مدينة محددة</option>
+              <option value="city_craftsmen">حرفيو مدينة محددة</option>
+            </select>
+            <label style="display:block;margin-top:12px">المدينة عند الحاجة</label>
+            <input name="city" maxlength="60" placeholder="دمشق">
+            <label style="display:block;margin-top:12px">تخصص اختياري للحرفيين</label>
+            <input name="specialty" maxlength="80" placeholder="كهرباء، سباكة...">
+            <button style="width:100%;margin-top:14px">إرسال الآن</button>
+          </form>
+          <div class="panel">
+            <h2>حالة التشغيل</h2>
+            <p class="muted">أي رسالة تُحفظ داخل الوارد دائماً. Push الخارجي يعمل فقط بعد وضع مفاتيح Firebase على Railway وإضافة google-services.json لتطبيق Android.</p>
+            ${status.error ? `<p class="error">${escapeHtml(status.error)}</p>` : ''}
+          </div>
+        </section>
+        <section class="panel" style="margin-top:16px"><h2>آخر الحملات</h2><table><thead><tr><th>الرسالة</th><th>الفئة</th><th>المستلمون</th><th>Push نجاح/فشل</th><th>التاريخ</th></tr></thead><tbody>${rows || '<tr><td colspan="5">لا توجد حملات بعد.</td></tr>'}</tbody></table></section>`
+    }));
+  }
+
   router.use(ensureDb);
   router.get('/login', (req, res) => {
     if (verifySession(req)) return res.redirect('/admin');
@@ -384,6 +443,26 @@ function createAdminDashboard({
     await cols().users.updateOne({ id: user.id }, { $set: { 'auth.failedLoginCount': 0, 'auth.loginBlockedUntil': 0, 'auth.unblockedAt': Date.now() } });
     await logAudit('admin.security.unblock', req, { userId: user.id, phone: user.phone, result: 'success' });
     res.redirect('/admin/security');
+  }));
+  router.get('/engagement', asyncRoute((req, res) => {
+    const sent = Number(req.query.sent || 0);
+    return renderEngagement(req, res, sent ? `تم إرسال الحملة إلى ${sent} مستخدم.` : '');
+  }));
+  router.post('/engagement/send', asyncRoute(async (req, res) => {
+    if (!sendAdminCampaign) return res.status(503).send('نظام الحملات غير متاح.');
+    try {
+      const { campaign } = await sendAdminCampaign({
+        title: req.body.title,
+        text: req.body.text,
+        target: req.body.target,
+        city: req.body.city,
+        specialty: req.body.specialty
+      }, req);
+      res.redirect(`/admin/engagement?sent=${encodeURIComponent(campaign.recipients)}`);
+    } catch (err) {
+      res.status(err.status || 400);
+      await renderEngagement(req, res, err.message || 'تعذر إرسال الحملة.');
+    }
   }));
 
   function asyncRoute(fn) {
