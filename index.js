@@ -40,10 +40,15 @@ const PASSWORD_MAX_FAILED_ATTEMPTS = Number(process.env.PASSWORD_MAX_FAILED_ATTE
 const PASSWORD_BCRYPT_ROUNDS = Number(process.env.PASSWORD_BCRYPT_ROUNDS || 12);
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '20m';
 const REFRESH_TOKEN_DAYS = Number(process.env.REFRESH_TOKEN_DAYS || 7);
-const ENCRYPTION_KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || SECRET).digest();
 if (process.env.NODE_ENV === 'production' && SECRET === 'hirfati-secret-key-2024') {
   throw new Error('JWT_SECRET must be set to a strong secret in production.');
 }
+if (process.env.NODE_ENV === 'production' && !process.env.ENCRYPTION_KEY) {
+  throw new Error('ENCRYPTION_KEY must be set to a separate strong secret in production.');
+}
+const createEncryptionKey = value => crypto.createHash('sha256').update(value).digest();
+const ENCRYPTION_KEY = createEncryptionKey(process.env.ENCRYPTION_KEY || SECRET);
+const LEGACY_ENCRYPTION_KEY = createEncryptionKey(SECRET);
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -91,7 +96,15 @@ const apiLimiter = rateLimit({
 });
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 5),
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: false,
+  message: { error: 'طلبات مصادقة كثيرة. حاول بعد 15 دقيقة.' }
+});
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.LOGIN_RATE_LIMIT_MAX || 5),
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: false,
@@ -167,13 +180,22 @@ const encryptSensitive = value => {
 };
 const decryptSensitive = payload => {
   if (!payload?.value || !payload?.iv || !payload?.tag) return null;
-  const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, Buffer.from(payload.iv, 'base64url'));
-  decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(payload.value, 'base64url')),
-    decipher.final()
-  ]);
-  return decrypted.toString('utf8');
+  const keys = [ENCRYPTION_KEY];
+  if (!ENCRYPTION_KEY.equals(LEGACY_ENCRYPTION_KEY)) keys.push(LEGACY_ENCRYPTION_KEY);
+  for (const key of keys) {
+    try {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(payload.iv, 'base64url'));
+      decipher.setAuthTag(Buffer.from(payload.tag, 'base64url'));
+      const decrypted = Buffer.concat([
+        decipher.update(Buffer.from(payload.value, 'base64url')),
+        decipher.final()
+      ]);
+      return decrypted.toString('utf8');
+    } catch (err) {
+      // Try the next key to support records encrypted before ENCRYPTION_KEY was introduced.
+    }
+  }
+  return null;
 };
 const publicUser = user => {
   const clean = stripMongoId(user);
@@ -208,7 +230,7 @@ const schemas = {
     specialty: optionalText(80),
     recoveryQuestion: safeText(120).required(),
     recoveryAnswer: safeText(120).required(),
-    recoveryEmail: Joi.string().trim().email().allow('', null).max(160)
+    recoveryEmail: Joi.string().trim().email().max(160).required()
   }),
   passwordLogin: Joi.object({ phone: phoneSchema, pin: pinSchema }),
   recoveryStart: Joi.object({ phone: phoneSchema }),
@@ -317,6 +339,15 @@ const validateIdParam = (req, res, next) => {
 };
 const requireAdmin = (req, res, next) => {
   if (req.user?.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
+  next();
+};
+const requireVerifiedEmail = (req, res, next) => {
+  if (req.currentUser?.emailVerificationRequired && !req.currentUser?.emailVerifiedAt) {
+    return res.status(403).json({
+      error: 'يرجى تأكيد البريد الإلكتروني قبل استخدام التطبيق.',
+      requiresEmailVerification: true
+    });
+  }
   next();
 };
 
@@ -561,7 +592,9 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
     passwordSetAt: Date.now(),
     recoveryQuestion: String(recoveryQuestion).trim(),
     recoveryAnswerHash,
-    recoveryEmailEnc: encryptSensitive(recoveryEmail ? String(recoveryEmail).trim().toLowerCase() : null),
+    recoveryEmailEnc: encryptSensitive(String(recoveryEmail).trim().toLowerCase()),
+    emailVerificationRequired: true,
+    emailVerifiedAt: null,
     auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
   };
 
@@ -570,7 +603,7 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
   res.json(await authPayload(user, req));
 }));
 
-app.post('/api/auth/password/login', authLimiter, validateBody(schemas.passwordLogin), asyncRoute(async (req, res) => {
+app.post('/api/auth/password/login', loginLimiter, validateBody(schemas.passwordLogin), asyncRoute(async (req, res) => {
   const phone = normalizePhone(req.body.phone);
   const { pin } = req.body;
   if (!phone || phone.length < 9) return res.status(400).json({ error: 'رقم الهاتف غير صحيح.' });
@@ -787,7 +820,7 @@ app.post('/api/auth/email/verification/confirm', authLimiter, authenticate, vali
     { id: req.user.id },
     {
       $set: { emailVerifiedAt: Date.now() },
-      $unset: { emailVerification: '' }
+      $unset: { emailVerification: '', emailVerificationRequired: '' }
     }
   );
   await logAudit('auth.email_verification.confirm', req, { userId: req.user.id, phone: user.phone, result: 'success' });
@@ -874,7 +907,7 @@ app.post('/api/auth/register', authLimiter, requireOtpEnabled, validateBody(sche
   res.json(await authPayload(user, req));
 }));
 
-app.post('/api/auth/login', authLimiter, (req, res) => {
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   res.status(410).json({ error: 'استخدم تسجيل الدخول بالـ PIN.' });
 });
 
@@ -916,7 +949,7 @@ app.get('/api/users/me', authenticate, asyncRoute(async (req, res) => {
   res.json(publicUser(user));
 }));
 
-app.put('/api/users/profile', authenticate, validateBody(schemas.profile), asyncRoute(async (req, res) => {
+app.put('/api/users/profile', authenticate, requireVerifiedEmail, validateBody(schemas.profile), asyncRoute(async (req, res) => {
   const { name, city, bio, range, avatar, specialty } = req.body;
   const current = await cols().users.findOne({ id: req.user.id });
   if (!current) return res.status(404).json({ error: 'غير موجود.' });
@@ -942,13 +975,13 @@ app.put('/api/users/profile', authenticate, validateBody(schemas.profile), async
   res.json({ success: true });
 }));
 
-app.get('/api/users/craftsmen', authenticate, asyncRoute(async (req, res) => {
-  const users = await cols().users.find({ role: 'craftsman' }).sort({ rating: -1, name: 1 }).toArray();
+app.get('/api/users/craftsmen', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
+  const users = await cols().users.find({ role: 'craftsman' }).sort({ rating: -1, name: 1 }).limit(500).toArray();
   res.json(users.map(publicUser));
 }));
 
 // --- IDENTITY REVIEW ---
-app.post('/api/identity-requests', authenticate, validateBody(schemas.identitySubmit), asyncRoute(async (req, res) => {
+app.post('/api/identity-requests', authenticate, requireVerifiedEmail, validateBody(schemas.identitySubmit), asyncRoute(async (req, res) => {
   const user = await cols().users.findOne({ id: req.user.id });
   if (!user) return res.status(404).json({ error: 'غير موجود.' });
   if (user.role !== 'craftsman') return res.status(403).json({ error: 'توثيق الهوية متاح للحرفيين حالياً.' });
@@ -980,8 +1013,8 @@ app.post('/api/identity-requests', authenticate, validateBody(schemas.identitySu
   res.json({ id: request.id, status: request.status, message: 'تم إرسال طلب التوثيق.' });
 }));
 
-app.get('/api/admin/identity-requests', authenticate, requireAdmin, asyncRoute(async (req, res) => {
-  const requests = await cols().identityRequests.find({}).sort({ createdAt: -1 }).toArray();
+app.get('/api/admin/identity-requests', authenticate, requireVerifiedEmail, requireAdmin, asyncRoute(async (req, res) => {
+  const requests = await cols().identityRequests.find({}).sort({ createdAt: -1 }).limit(500).toArray();
   res.json(requests.map(request => {
     const clean = stripMongoId(request);
     clean.idCardImage = decryptSensitive(request.idCardImageEnc);
@@ -995,7 +1028,7 @@ app.get('/api/admin/identity-requests', authenticate, requireAdmin, asyncRoute(a
   }));
 }));
 
-app.put('/api/admin/identity-requests/:id/status', authenticate, requireAdmin, validateIdParam, validateBody(schemas.identityDecision), asyncRoute(async (req, res) => {
+app.put('/api/admin/identity-requests/:id/status', authenticate, requireVerifiedEmail, requireAdmin, validateIdParam, validateBody(schemas.identityDecision), asyncRoute(async (req, res) => {
   const request = await cols().identityRequests.findOne({ id: req.params.id });
   if (!request) return res.status(404).json({ error: 'الطلب غير موجود.' });
   if (request.status !== 'pending') return res.status(409).json({ error: 'تمت مراجعة هذا الطلب مسبقاً.' });
@@ -1030,12 +1063,17 @@ app.put('/api/admin/identity-requests/:id/status', authenticate, requireAdmin, v
 }));
 
 // --- JOBS ---
-app.get('/api/jobs', authenticate, asyncRoute(async (req, res) => {
-  const jobs = await cols().jobs.find({}).sort({ createdAt: -1 }).toArray();
+app.get('/api/jobs', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
+  const filter = req.user.role === 'admin'
+    ? {}
+    : req.user.role === 'client'
+      ? { clientId: req.user.id }
+      : { $or: [{ status: 'open' }, { chosenCraftsman: req.user.id }, { clientId: req.user.id }] };
+  const jobs = await cols().jobs.find(filter).sort({ createdAt: -1 }).limit(500).toArray();
   res.json(normalizeMany(jobs));
 }));
 
-app.post('/api/jobs', authenticate, validateBody(schemas.jobCreate), asyncRoute(async (req, res) => {
+app.post('/api/jobs', authenticate, requireVerifiedEmail, validateBody(schemas.jobCreate), asyncRoute(async (req, res) => {
   const { title, desc, category, city, area, photos, budget, schedule, urgency } = req.body;
   const job = {
     id: id('j'),
@@ -1059,7 +1097,7 @@ app.post('/api/jobs', authenticate, validateBody(schemas.jobCreate), asyncRoute(
   res.json({ id: job.id });
 }));
 
-app.put('/api/jobs/:id/status', authenticate, validateIdParam, validateBody(schemas.jobStatus), asyncRoute(async (req, res) => {
+app.put('/api/jobs/:id/status', authenticate, requireVerifiedEmail, validateIdParam, validateBody(schemas.jobStatus), asyncRoute(async (req, res) => {
   const { status, chosenCraftsman, cancelReason } = req.body;
   const job = await cols().jobs.findOne({ id: req.params.id });
   if (!job) return res.status(404).json({ error: 'غير موجود.' });
@@ -1084,12 +1122,19 @@ app.put('/api/jobs/:id/status', authenticate, validateIdParam, validateBody(sche
 }));
 
 // --- INTERESTS ---
-app.get('/api/interests', authenticate, asyncRoute(async (req, res) => {
-  const interests = await cols().interests.find({}).sort({ createdAt: -1 }).toArray();
+app.get('/api/interests', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
+  let filter = {};
+  if (req.user.role === 'craftsman') {
+    filter = { craftsmanId: req.user.id };
+  } else if (req.user.role === 'client') {
+    const ownedJobs = await cols().jobs.find({ clientId: req.user.id }, { projection: { id: 1 } }).limit(500).toArray();
+    filter = { jobId: { $in: ownedJobs.map(job => job.id) } };
+  }
+  const interests = await cols().interests.find(filter).sort({ createdAt: -1 }).limit(500).toArray();
   res.json(normalizeMany(interests));
 }));
 
-app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), asyncRoute(async (req, res) => {
+app.post('/api/interests', authenticate, requireVerifiedEmail, validateBody(schemas.interestCreate), asyncRoute(async (req, res) => {
   const { jobId, note, estimate } = req.body;
   if (req.user.role !== 'craftsman' && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'إرسال العروض متاح للحرفيين فقط.' });
@@ -1118,7 +1163,7 @@ app.post('/api/interests', authenticate, validateBody(schemas.interestCreate), a
   res.json({ id: interest.id });
 }));
 
-app.put('/api/interests/:id/status', authenticate, validateIdParam, validateBody(schemas.interestStatus), asyncRoute(async (req, res) => {
+app.put('/api/interests/:id/status', authenticate, requireVerifiedEmail, validateIdParam, validateBody(schemas.interestStatus), asyncRoute(async (req, res) => {
   const { status } = req.body;
   if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'حالة العرض غير صحيحة.' });
 
@@ -1151,14 +1196,14 @@ app.put('/api/interests/:id/status', authenticate, validateIdParam, validateBody
 }));
 
 // --- MESSAGES ---
-app.get('/api/messages', authenticate, asyncRoute(async (req, res) => {
+app.get('/api/messages', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   const messages = await cols().messages.find({
     $or: [{ senderId: req.user.id }, { receiverId: req.user.id }]
-  }).sort({ at: 1 }).toArray();
+  }).sort({ at: 1 }).limit(500).toArray();
   res.json(normalizeMany(messages));
 }));
 
-app.post('/api/messages', authenticate, validateBody(schemas.messageCreate), asyncRoute(async (req, res) => {
+app.post('/api/messages', authenticate, requireVerifiedEmail, validateBody(schemas.messageCreate), asyncRoute(async (req, res) => {
   const { jobId, receiverId, text, image } = req.body;
   if (!text && !image) return res.status(400).json({ error: 'اكتب رسالة أو أرسل صورة.' });
   const job = await cols().jobs.findOne({ id: jobId });
@@ -1184,25 +1229,25 @@ app.post('/api/messages', authenticate, validateBody(schemas.messageCreate), asy
 }));
 
 // --- NOTIFICATIONS ---
-app.get('/api/notifications', authenticate, asyncRoute(async (req, res) => {
+app.get('/api/notifications', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   const notifications = await cols().notifications.find({
     userId: { $in: [req.user.id, 'all'] }
-  }).sort({ at: -1 }).toArray();
+  }).sort({ at: -1 }).limit(200).toArray();
   res.json(normalizeMany(notifications));
 }));
 
-app.post('/api/notifications/read', authenticate, asyncRoute(async (req, res) => {
+app.post('/api/notifications/read', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   await cols().notifications.updateMany({ userId: req.user.id }, { $set: { read: 1 } });
   res.json({ success: true });
 }));
 
 // --- REVIEWS ---
-app.get('/api/reviews', authenticate, asyncRoute(async (req, res) => {
-  const reviews = await cols().reviews.find({}).sort({ at: -1 }).toArray();
+app.get('/api/reviews', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
+  const reviews = await cols().reviews.find({}).sort({ at: -1 }).limit(500).toArray();
   res.json(normalizeMany(reviews));
 }));
 
-app.post('/api/reviews', authenticate, validateBody(schemas.reviewCreate), asyncRoute(async (req, res) => {
+app.post('/api/reviews', authenticate, requireVerifiedEmail, validateBody(schemas.reviewCreate), asyncRoute(async (req, res) => {
   const { craftsmanId, rating, title, text } = req.body;
   if (req.user.id === craftsmanId) return res.status(403).json({ error: 'لا يمكنك تقييم حسابك.' });
   const completedJob = await cols().jobs.findOne({
@@ -1240,7 +1285,7 @@ app.post('/api/reviews', authenticate, validateBody(schemas.reviewCreate), async
 }));
 
 // --- REPORTS ---
-app.post('/api/reports', authenticate, validateBody(schemas.reportCreate), asyncRoute(async (req, res) => {
+app.post('/api/reports', authenticate, requireVerifiedEmail, validateBody(schemas.reportCreate), asyncRoute(async (req, res) => {
   const { type, targetId, reason } = req.body;
   const report = {
     id: id('rep'),
@@ -1254,14 +1299,14 @@ app.post('/api/reports', authenticate, validateBody(schemas.reportCreate), async
   res.json({ id: report.id });
 }));
 
-app.get('/api/reports', authenticate, asyncRoute(async (req, res) => {
+app.get('/api/reports', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
-  const reports = await cols().reports.find({}).sort({ at: -1 }).toArray();
+  const reports = await cols().reports.find({}).sort({ at: -1 }).limit(500).toArray();
   res.json(normalizeMany(reports));
 }));
 
 // --- UPLOAD ---
-app.post('/api/upload', authenticate, upload.array('photos', 5), (req, res) => {
+app.post('/api/upload', authenticate, requireVerifiedEmail, upload.array('photos', 5), (req, res) => {
   res.json({ urls: req.files.map(f => `/uploads/${f.filename}`) });
 });
 
