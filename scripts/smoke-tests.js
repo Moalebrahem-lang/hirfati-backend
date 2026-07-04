@@ -3,6 +3,7 @@ const crypto = require('crypto');
 
 require('../loadEnv')();
 const { connect, cols } = require('../db');
+const { isCloudinaryConfigured } = require('../cloudinary');
 
 const PORT = Number(process.env.SMOKE_TEST_PORT || 5057);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -12,6 +13,7 @@ const testStartedAt = Date.now();
 const testPhone = `+31911${String(stamp).slice(-7)}`;
 const normalizedTestPhone = testPhone.replace(/\D/g, '');
 const testEmail = `hirfati-smoke-${stamp}@resend.dev`;
+const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 let server;
 let testUserId;
@@ -215,6 +217,29 @@ async function run() {
       'Paginated jobs list failed.'
     );
     logPass('paginated jobs list');
+
+    const imageJob = await request('/api/jobs', {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({
+        title: 'طلب اختبار صورة',
+        desc: 'هذا الطلب يختبر تخزين الصور في Cloudinary.',
+        category: 'كهرباء',
+        city: 'دمشق',
+        area: 'المزة',
+        urgency: 'normal',
+        photos: [tinyPng]
+      })
+    });
+    if (isCloudinaryConfigured()) {
+      assert(imageJob.status === 200 && imageJob.body?.id, `Cloudinary image job failed with ${imageJob.status}.`);
+      const storedImageJob = await cols().jobs.findOne({ id: imageJob.body.id });
+      assert(/^https:\/\/res\.cloudinary\.com\//.test(storedImageJob?.photos?.[0] || ''), 'Image was not stored as a Cloudinary URL.');
+      logPass('cloudinary image upload');
+    } else {
+      assert(imageJob.status === 503, `Unconfigured Cloudinary should return 503, got ${imageJob.status}.`);
+      logPass('image upload fails safely when Cloudinary is not configured');
+    }
   } finally {
     await cleanup().catch(err => console.error(`Cleanup failed: ${err.message}`));
     if (server && !server.killed) server.kill('SIGTERM');

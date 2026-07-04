@@ -16,6 +16,7 @@ const { sendOtp } = require('./sms');
 const { sendVerificationEmail } = require('./email');
 const { pushStatus, sendToTokens } = require('./push');
 const createAdminDashboard = require('./adminDashboard');
+const { uploadImageDataUri, uploadImages, bufferToDataUri } = require('./cloudinary');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -127,18 +128,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${path.extname(file.originalname)}`);
-  }
-});
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith('image/')) return cb(new Error('يسمح برفع الصور فقط.'));
@@ -221,7 +212,7 @@ const optionalText = (max = 200) => Joi.string().trim().allow('', null).max(max)
 const phoneSchema = Joi.string().trim().min(7).max(24).pattern(/^[+\d\s().-]+$/).required();
 const pinSchema = Joi.string().trim().pattern(/^\d{4,6}$/).required();
 const idSchema = Joi.string().trim().min(2).max(40).pattern(/^[A-Za-z0-9_-]+$/);
-const imageSchema = Joi.string().trim().max(8 * 1024 * 1024).pattern(/^(data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+|\/uploads\/[A-Za-z0-9_.-]+)$/);
+const imageSchema = Joi.string().trim().max(8 * 1024 * 1024).pattern(/^(data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+|\/uploads\/[A-Za-z0-9_.-]+|https:\/\/res\.cloudinary\.com\/[^/]+\/image\/upload\/.+)$/);
 const identityImageSchema = Joi.string().trim().max(6 * 1024 * 1024).pattern(/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/).required();
 const schemas = {
   passwordRegister: Joi.object({
@@ -1283,6 +1274,10 @@ app.get('/api/jobs', authenticate, requireVerifiedEmail, asyncRoute(async (req, 
 
 app.post('/api/jobs', authenticate, requireVerifiedEmail, validateBody(schemas.jobCreate), asyncRoute(async (req, res) => {
   const { title, desc, category, city, area, photos, budget, schedule, urgency } = req.body;
+  const hostedPhotos = await uploadImages(photos || [], {
+    folder: 'hirfati/jobs',
+    publicId: `${req.user.id}-${Date.now()}`
+  });
   const job = {
     id: id('j'),
     title,
@@ -1294,7 +1289,7 @@ app.post('/api/jobs', authenticate, requireVerifiedEmail, validateBody(schemas.j
     createdAt: Date.now(),
     clientId: req.user.id,
     status: 'open',
-    photos: photos || [],
+    photos: hostedPhotos,
     budget: budget || null,
     schedule: schedule || null,
     urgency: urgency || 'normal',
@@ -1438,13 +1433,16 @@ app.post('/api/messages', authenticate, requireVerifiedEmail, validateBody(schem
   if (!allowedParticipants.has(req.user.id) || !allowedParticipants.has(receiverId)) {
     return res.status(403).json({ error: 'غير مسموح بإرسال رسالة على هذا الطلب.' });
   }
+  const hostedImage = image
+    ? await uploadImageDataUri(image, { folder: 'hirfati/messages', publicId: `${req.user.id}-${Date.now()}` })
+    : null;
   const message = {
     id: id('m'),
     jobId,
     senderId: req.user.id,
     receiverId,
     text: text || '',
-    image: image || null,
+    image: hostedImage,
     at: Date.now()
   };
   await cols().messages.insertOne(message);
@@ -1567,9 +1565,13 @@ app.get('/api/reports', authenticate, requireVerifiedEmail, asyncRoute(async (re
 }));
 
 // --- UPLOAD ---
-app.post('/api/upload', authenticate, requireVerifiedEmail, upload.array('photos', 5), (req, res) => {
-  res.json({ urls: req.files.map(f => `/uploads/${f.filename}`) });
-});
+app.post('/api/upload', authenticate, requireVerifiedEmail, upload.array('photos', 5), asyncRoute(async (req, res) => {
+  const urls = await Promise.all((req.files || []).map((file, index) => uploadImageDataUri(
+    bufferToDataUri(file),
+    { folder: 'hirfati/uploads', publicId: `${req.user.id}-${Date.now()}-${index + 1}` }
+  )));
+  res.json({ urls });
+}));
 
 async function runEngagementTriggers() {
   const now = Date.now();
@@ -1675,6 +1677,12 @@ app.use((err, req, res, next) => {
   }
   if (err.code === 'EMAIL_SEND_FAILED') {
     return res.status(502).json({ error: 'تعذر إرسال البريد حالياً.' });
+  }
+  if (err.code === 'IMAGE_STORAGE_NOT_CONFIGURED') {
+    return res.status(503).json({ error: 'تخزين الصور غير مفعّل حالياً.' });
+  }
+  if (err.code === 'IMAGE_UPLOAD_FAILED') {
+    return res.status(502).json({ error: 'تعذر رفع الصورة حالياً.' });
   }
   if (err.code === 'WHATSAPP_NOT_CONFIGURED') {
     return res.status(503).json({ error: 'خدمة واتساب غير مفعلة حالياً.' });
