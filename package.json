@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "test": "npm run test:smoke",
+    "test:smoke": "node scripts/smoke-tests.js"
   },
   "engines": {
     "node": "20.x"
