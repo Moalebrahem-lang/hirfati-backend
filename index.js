@@ -713,15 +713,18 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
   const { users } = cols();
   const existing = await users.findOne({ phone });
   if (existing?.passwordHash) return res.status(409).json({ error: 'هذا الرقم مسجل مسبقاً. سجّل الدخول بالـ PIN.' });
-  if (existing && !existing.passwordHash) {
-    return res.status(409).json({ error: 'هذا الحساب موجود ويحتاج تفعيل كلمة مرور من الإدارة.' });
-  }
 
   const passwordHash = await bcrypt.hash(String(pin), PASSWORD_BCRYPT_ROUNDS);
   const recoveryAnswerHash = await bcrypt.hash(normalizeRecoveryAnswer(recoveryAnswer), PASSWORD_BCRYPT_ROUNDS);
   const cleanName = String(name).trim();
+  const userId = existing?.id || id('u');
+  const email = String(recoveryEmail).trim().toLowerCase();
+  const emailCode = createEmailCode();
+  await sendVerificationEmail(email, emailCode);
+
   const user = {
-    id: id('u'),
+    ...(existing || {}),
+    id: userId,
     name: cleanName,
     phone,
     role: role || 'client',
@@ -736,18 +739,25 @@ app.post('/api/auth/password/register', authLimiter, validateBody(schemas.passwo
     jobsDone: 0,
     range: 25,
     saved: [],
-    createdAt: Date.now(),
+    createdAt: existing?.createdAt || Date.now(),
     passwordHash,
     passwordSetAt: Date.now(),
     recoveryQuestion: String(recoveryQuestion).trim(),
     recoveryAnswerHash,
-    recoveryEmailEnc: encryptSensitive(String(recoveryEmail).trim().toLowerCase()),
+    recoveryEmailEnc: encryptSensitive(email),
+    emailVerification: {
+      hash: hashEmailCode(userId, emailCode),
+      expiresAt: Date.now() + EMAIL_CODE_TTL_MINUTES * 60 * 1000,
+      attempts: 0,
+      requestedAt: Date.now()
+    },
     emailVerificationRequired: true,
     emailVerifiedAt: null,
     auth: { failedLoginCount: 0, loginBlockedUntil: 0 }
   };
 
-  await users.insertOne(user);
+  if (existing) await users.updateOne({ phone }, { $set: user });
+  else await users.insertOne(user);
   await logAudit('auth.register', req, { phone, userId: user.id, result: 'success', meta: { role: user.role } });
   res.json(await authPayload(user, req));
 }));
