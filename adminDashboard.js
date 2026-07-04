@@ -87,6 +87,24 @@ function createAdminDashboard({
       return null;
     }
   }
+  function sessionToken(req) {
+    return parseCookies(req)[COOKIE_NAME] || '';
+  }
+  function csrfToken(req) {
+    return require('crypto')
+      .createHmac('sha256', secret)
+      .update(sessionToken(req))
+      .digest('base64url');
+  }
+  function csrfInput(req) {
+    return `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken(req))}">`;
+  }
+  function verifyCsrf(req) {
+    const expected = csrfToken(req);
+    const actual = String(req.body?._csrf || '');
+    if (!expected || !actual || expected.length !== actual.length) return false;
+    return require('crypto').timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+  }
   const normalizeUsername = value => String(value ?? '').trim().toLowerCase();
   const normalizePassword = value => String(value ?? '').trim();
 
@@ -145,7 +163,7 @@ function createAdminDashboard({
     @media(max-width:820px){.layout{display:block}aside{position:static;height:auto;border-left:0;border-bottom:1px solid var(--line)}.logout{position:static;margin-top:14px}main{padding:18px}.stats,.two,.filters{grid-template-columns:1fr}.top{display:block}.imgs img{height:150px}table{display:block;overflow-x:auto;white-space:nowrap}}
   </style>
 </head>
-<body>${verifySession(req) ? `<div class="layout"><aside><div class="brand"><div class="logo">ح</div><div><h2>إدارة حرفتي</h2><small>لوحة التحكم</small></div></div><nav>${nav}</nav><form class="logout" method="post" action="/admin/logout"><button class="secondary">تسجيل الخروج</button></form></aside><main>${content}</main></div>` : content}</body>
+<body>${verifySession(req) ? `<div class="layout"><aside><div class="brand"><div class="logo">ح</div><div><h2>إدارة حرفتي</h2><small>لوحة التحكم</small></div></div><nav>${nav}</nav><form class="logout" method="post" action="/admin/logout">${csrfInput(req)}<button class="secondary">تسجيل الخروج</button></form></aside><main>${content}</main></div>` : content}</body>
 </html>`;
   }
 
@@ -226,7 +244,7 @@ function createAdminDashboard({
       <td><strong>${escapeHtml(u.name)}</strong><br><span class="muted">${escapeHtml(u.city || '')} ${u.specialty ? `· ${escapeHtml(u.specialty)}` : ''}</span></td>
       <td>${escapeHtml(u.phone)}</td><td>${roleName(u.role)}</td><td>${userStatusBadge(u)}</td><td>${fmtDate(u.passwordSetAt || u.identityVerifiedAt)}</td>
       <td><details><summary>تفاصيل</summary><p class="muted">ID: ${escapeHtml(u.id)}<br>تقييم: ${escapeHtml(u.rating || 0)} · أعمال: ${escapeHtml(u.jobsDone || 0)}<br>${escapeHtml(u.bio || '')}</p></details></td>
-      <td><form class="inline" method="post" action="/admin/users/${encodeURIComponent(u.id)}/toggle"><button class="${u.disabledAt ? 'ok' : 'danger'}">${u.disabledAt ? 'تفعيل' : 'تعطيل'}</button></form></td>
+      <td><form class="inline" method="post" action="/admin/users/${encodeURIComponent(u.id)}/toggle">${csrfInput(req)}<button class="${u.disabledAt ? 'ok' : 'danger'}">${u.disabledAt ? 'تفعيل' : 'تعطيل'}</button></form></td>
     </tr>`).join('');
     res.send(renderShell(req, {
       title: 'المستخدمون',
@@ -285,7 +303,7 @@ function createAdminDashboard({
           <p class="muted">${escapeHtml(r.phone)} · ${r.type === 'password_recovery' ? 'استرجاع كلمة مرور' : 'توثيق حرفي'} · ${fmtDate(r.createdAt)}</p>
           <div class="imgs"><div><p class="muted">صورة البطاقة</p>${idCard ? `<a href="${idCard}" target="_blank"><img src="${idCard}" alt="صورة البطاقة"></a>` : '<div class="panel muted">لا توجد صورة</div>'}</div><div><p class="muted">سيلفي مع البطاقة</p>${selfie ? `<a href="${selfie}" target="_blank"><img src="${selfie}" alt="سيلفي مع البطاقة"></a>` : '<div class="panel muted">لا توجد صورة</div>'}</div></div>
           ${r.note ? `<p>${escapeHtml(r.note)}</p>` : ''}
-          ${r.status === 'pending' ? `<form method="post" action="/admin/verifications/${encodeURIComponent(r.id)}/decision">
+          ${r.status === 'pending' ? `<form method="post" action="/admin/verifications/${encodeURIComponent(r.id)}/decision">${csrfInput(req)}
             <textarea name="note" placeholder="سبب الرفض أو ملاحظة داخلية"></textarea>
             <div class="actions"><button class="ok" name="status" value="approved">✅ موافقة</button><button class="danger" name="status" value="rejected">❌ رفض</button></div>
           </form>` : `<p class="muted">تمت المراجعة: ${fmtDate(r.reviewedAt)} ${r.adminNote ? `· ${escapeHtml(r.adminNote)}` : ''}</p>`}
@@ -312,7 +330,7 @@ function createAdminDashboard({
       cols().users.find({ 'auth.loginBlockedUntil': { $gt: now } }).sort({ 'auth.loginBlockedUntil': -1 }).toArray()
     ]);
     const failedRows = failed.map(log => `<tr><td>${fmtDate(log.at)}</td><td>${escapeHtml(log.phone || '')}</td><td>${escapeHtml(log.result)}</td><td>${escapeHtml(log.ip || '')}</td><td>${escapeHtml(log.meta?.reason || '')}</td></tr>`).join('');
-    const blockedRows = blocked.map(u => `<tr><td>${escapeHtml(u.name)}</td><td>${escapeHtml(u.phone)}</td><td>${fmtDate(u.auth?.loginBlockedUntil)}</td><td><form method="post" action="/admin/security/unblock/${encodeURIComponent(u.id)}"><button class="secondary">رفع الحظر</button></form></td></tr>`).join('');
+    const blockedRows = blocked.map(u => `<tr><td>${escapeHtml(u.name)}</td><td>${escapeHtml(u.phone)}</td><td>${fmtDate(u.auth?.loginBlockedUntil)}</td><td><form method="post" action="/admin/security/unblock/${encodeURIComponent(u.id)}">${csrfInput(req)}<button class="secondary">رفع الحظر</button></form></td></tr>`).join('');
     res.send(renderShell(req, {
       title: 'الأمان',
       active: '/admin/security',
@@ -348,7 +366,7 @@ function createAdminDashboard({
           <div class="stat"><b>${campaigns.length}</b><span>آخر الحملات</span></div>
         </section>
         <section class="grid two">
-          <form class="panel" method="post" action="/admin/engagement/send">
+          <form class="panel" method="post" action="/admin/engagement/send">${csrfInput(req)}
             <h2>إرسال رسالة جماعية</h2>
             <label>العنوان</label>
             <input name="title" maxlength="90" required placeholder="مثلاً: عرض خاص هذا الأسبوع">
@@ -404,12 +422,20 @@ function createAdminDashboard({
     await logAudit('admin.login', req, { userId: admin.id, phone: admin.phone, result: 'success' });
     res.redirect('/admin');
   });
+  router.use(requireSession);
+  router.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    if (verifyCsrf(req)) return next();
+    return res.status(403).send(renderShell(req, {
+      title: 'طلب غير صالح',
+      active: '',
+      content: '<section class="panel"><h1>انتهت صلاحية النموذج</h1><p class="muted">حدّث الصفحة وحاول مرة ثانية.</p></section>'
+    }));
+  });
   router.post('/logout', (req, res) => {
     clearSessionCookie(res);
     res.redirect('/admin/login');
   });
-
-  router.use(requireSession);
   router.get('/', asyncRoute(renderDashboard));
   router.get('/users', asyncRoute(renderUsers));
   router.post('/users/:id/toggle', asyncRoute(async (req, res) => {

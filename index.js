@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./loadEnv')();
 
 const express = require('express');
 const cors = require('cors');
@@ -351,6 +351,47 @@ const validateIdParam = (req, res, next) => {
   const { error } = idSchema.required().validate(req.params.id);
   if (error) return res.status(400).json({ error: 'المعرّف غير صحيح.' });
   next();
+};
+const wantsPaginatedResponse = req => (
+  req.query.paginated === '1' || req.query.limit !== undefined || req.query.cursor !== undefined
+);
+const pageLimit = (req, fallback = 50, max = 100) => {
+  const parsed = Number(req.query.limit || fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(Math.floor(parsed), max));
+};
+const encodeCursor = (doc, timeField) => {
+  if (!doc) return null;
+  return Buffer.from(JSON.stringify({ t: doc[timeField], id: doc.id || '' })).toString('base64url');
+};
+const decodeCursor = value => {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'));
+    if (!Number.isFinite(Number(parsed.t)) || typeof parsed.id !== 'string') return null;
+    return { t: Number(parsed.t), id: parsed.id };
+  } catch {
+    return null;
+  }
+};
+const addCursorFilter = (filter, req, timeField, direction = 'desc') => {
+  const cursor = decodeCursor(req.query.cursor);
+  if (!cursor) return filter;
+  const op = direction === 'asc' ? '$gt' : '$lt';
+  const idOp = direction === 'asc' ? '$gt' : '$lt';
+  const cursorFilter = {
+    $or: [
+      { [timeField]: { [op]: cursor.t } },
+      { [timeField]: cursor.t, id: { [idOp]: cursor.id } }
+    ]
+  };
+  return Object.keys(filter || {}).length ? { $and: [filter, cursorFilter] } : cursorFilter;
+};
+const sendList = (req, res, docs, limit, timeField, mapper = stripMongoId) => {
+  if (!wantsPaginatedResponse(req)) return res.json(docs.map(mapper));
+  const items = docs.slice(0, limit);
+  const nextCursor = docs.length > limit ? encodeCursor(items[items.length - 1], timeField) : null;
+  return res.json({ items: items.map(mapper), nextCursor });
 };
 const requireAdmin = (req, res, next) => {
   if (req.user?.role !== 'admin') return res.status(403).json({ error: 'غير مسموح.' });
@@ -1228,13 +1269,16 @@ app.post('/api/admin/campaigns', authenticate, requireVerifiedEmail, requireAdmi
 
 // --- JOBS ---
 app.get('/api/jobs', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
-  const filter = req.user.role === 'admin'
+  const baseFilter = req.user.role === 'admin'
     ? {}
     : req.user.role === 'client'
       ? { clientId: req.user.id }
       : { $or: [{ status: 'open' }, { chosenCraftsman: req.user.id }, { clientId: req.user.id }] };
-  const jobs = await cols().jobs.find(filter).sort({ createdAt: -1 }).limit(500).toArray();
-  res.json(normalizeMany(jobs));
+  const paginated = wantsPaginatedResponse(req);
+  const limit = paginated ? pageLimit(req) : 500;
+  const filter = addCursorFilter(baseFilter, req, 'createdAt', 'desc');
+  const jobs = await cols().jobs.find(filter).sort({ createdAt: -1, id: -1 }).limit(limit + (paginated ? 1 : 0)).toArray();
+  sendList(req, res, jobs, limit, 'createdAt');
 }));
 
 app.post('/api/jobs', authenticate, requireVerifiedEmail, validateBody(schemas.jobCreate), asyncRoute(async (req, res) => {
@@ -1376,10 +1420,13 @@ app.put('/api/interests/:id/status', authenticate, requireVerifiedEmail, validat
 
 // --- MESSAGES ---
 app.get('/api/messages', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
-  const messages = await cols().messages.find({
+  const paginated = wantsPaginatedResponse(req);
+  const limit = paginated ? pageLimit(req) : 500;
+  const filter = addCursorFilter({
     $or: [{ senderId: req.user.id }, { receiverId: req.user.id }]
-  }).sort({ at: 1 }).limit(500).toArray();
-  res.json(normalizeMany(messages));
+  }, req, 'at', 'asc');
+  const messages = await cols().messages.find(filter).sort({ at: 1, id: 1 }).limit(limit + (paginated ? 1 : 0)).toArray();
+  sendList(req, res, messages, limit, 'at');
 }));
 
 app.post('/api/messages', authenticate, requireVerifiedEmail, validateBody(schemas.messageCreate), asyncRoute(async (req, res) => {
@@ -1438,10 +1485,13 @@ app.post('/api/notifications/device-token', authenticate, requireVerifiedEmail, 
 }));
 
 app.get('/api/notifications', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {
-  const notifications = await cols().notifications.find({
+  const paginated = wantsPaginatedResponse(req);
+  const limit = paginated ? pageLimit(req) : 200;
+  const filter = addCursorFilter({
     userId: { $in: [req.user.id, 'all'] }
-  }).sort({ at: -1 }).limit(200).toArray();
-  res.json(normalizeMany(notifications));
+  }, req, 'at', 'desc');
+  const notifications = await cols().notifications.find(filter).sort({ at: -1, id: -1 }).limit(limit + (paginated ? 1 : 0)).toArray();
+  sendList(req, res, notifications, limit, 'at');
 }));
 
 app.post('/api/notifications/read', authenticate, requireVerifiedEmail, asyncRoute(async (req, res) => {

@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./loadEnv')();
 
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -98,23 +98,31 @@ async function createIndexes(db) {
     db.collection('users').createIndex({ username: 1 }, { unique: true, sparse: true }),
     db.collection('users').createIndex({ id: 1 }, { unique: true }),
     db.collection('users').createIndex({ role: 1, city: 1 }),
+    db.collection('users').createIndex({ role: 1, rating: -1, name: 1 }),
+    db.collection('users').createIndex({ role: 1, city: 1, rating: -1, name: 1 }),
     db.collection('jobs').createIndex({ id: 1 }, { unique: true }),
     db.collection('jobs').createIndex({ createdAt: -1 }),
     db.collection('jobs').createIndex({ status: 1, category: 1, city: 1 }),
+    db.collection('jobs').createIndex({ status: 1, category: 1, city: 1, createdAt: -1 }),
     db.collection('jobs').createIndex({ clientId: 1 }),
+    db.collection('jobs').createIndex({ clientId: 1, createdAt: -1 }),
     db.collection('jobs').createIndex({ chosenCraftsman: 1, createdAt: -1 }),
     db.collection('interests').createIndex({ id: 1 }, { unique: true }),
     db.collection('interests').createIndex({ jobId: 1, craftsmanId: 1 }),
     db.collection('interests').createIndex({ craftsmanId: 1, createdAt: -1 }),
     db.collection('messages').createIndex({ jobId: 1, at: 1 }),
     db.collection('messages').createIndex({ senderId: 1, receiverId: 1, at: 1 }),
+    db.collection('messages').createIndex({ senderId: 1, at: 1 }),
+    db.collection('messages').createIndex({ receiverId: 1, at: 1 }),
     db.collection('notifications').createIndex({ userId: 1, at: -1 }),
+    db.collection('notifications').createIndex({ userId: 1, read: 1, at: -1 }),
     db.collection('deviceTokens').createIndex({ token: 1 }, { unique: true }),
     db.collection('deviceTokens').createIndex({ userId: 1, updatedAt: -1 }),
     db.collection('engagementEvents').createIndex({ key: 1 }, { unique: true }),
     db.collection('engagementEvents').createIndex({ type: 1, createdAt: -1 }),
     db.collection('campaigns').createIndex({ createdAt: -1 }),
     db.collection('reviews').createIndex({ craftsmanId: 1, at: -1 }),
+    db.collection('reviews').createIndex({ at: -1 }),
     db.collection('reports').createIndex({ targetId: 1, at: -1 }),
     db.collection('otps').createIndex({ phone: 1, purpose: 1 }),
     db.collection('otps').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
