@@ -7,7 +7,9 @@
     "start": "node index.js",
     "dev": "node index.js",
     "test": "npm run test:smoke",
-    "test:smoke": "node scripts/smoke-tests.js"
+    "test:smoke": "node scripts/smoke-tests.js",
+    "migrate:images:dry-run": "node scripts/migrate-images-cloudinary.js",
+    "migrate:images": "node scripts/migrate-images-cloudinary.js --apply"
   },
   "engines": {
     "node": "20.x"
