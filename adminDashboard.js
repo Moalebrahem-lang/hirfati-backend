@@ -49,6 +49,20 @@ function createAdminDashboard({
     const [text, cls] = map[status] || [status || 'غير معروف', 'muted'];
     return `<span class="badge ${cls}">${escapeHtml(text)}</span>`;
   };
+  const jobStatusBadge = status => {
+    const map = {
+      open: ['مفتوح', 'warn'],
+      matched: ['متفق عليه', 'ok'],
+      done: ['منجز', 'ok'],
+      reviewed: ['تم تقييمه', 'ok'],
+      cancelled: ['ملغى', 'danger']
+    };
+    const [text, cls] = map[status] || [status || 'غير معروف', 'muted'];
+    return `<span class="badge ${cls}">${escapeHtml(text)}</span>`;
+  };
+  const notificationReadBadge = read => read
+    ? '<span class="badge ok">مقروء</span>'
+    : '<span class="badge warn">غير مقروء</span>';
   const userStatusBadge = user => {
     if (user.disabledAt) return '<span class="badge danger">معطل</span>';
     if (user.verified) return '<span class="badge ok">موثق</span>';
@@ -132,6 +146,9 @@ function createAdminDashboard({
     const nav = [
       ['/admin', 'الرئيسية'],
       ['/admin/users', 'المستخدمون'],
+      ['/admin/jobs', 'الطلبات'],
+      ['/admin/messages', 'الرسائل'],
+      ['/admin/notifications', 'الإشعارات'],
       ['/admin/verifications', 'التحقق من الهوية'],
       ['/admin/security', 'الأمان'],
       ['/admin/engagement', 'التفاعل']
@@ -157,7 +174,7 @@ function createAdminDashboard({
     .badge{display:inline-flex;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800}.ok{background:#E7F6EE;color:var(--ok)}.warn{background:#FFF4D8;color:var(--warn)}.danger{background:#FDECEA;color:var(--danger)}.muted.badge{background:#EFEFF2;color:var(--muted)}
     button,.btn{border:0;border-radius:10px;background:var(--p);color:#fff;padding:10px 13px;font-weight:800;cursor:pointer;font-family:inherit}.btn.secondary,button.secondary{background:#fff;color:var(--p);border:1px solid var(--p)}button.danger{background:var(--danger)}button.ok{background:var(--ok);color:#fff}
     input,select,textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:11px 12px;font-family:inherit;background:#fff}textarea{min-height:82px;resize:vertical}.filters{display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:10px;margin-bottom:16px}
-    .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}.verify-card{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden}.verify-card .body{padding:16px}.imgs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.imgs img{width:100%;height:190px;object-fit:cover;border-radius:10px;border:1px solid var(--line);background:#fafafa}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}.verify-card{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden}.verify-card .body{padding:16px}.imgs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.imgs img{width:100%;height:190px;object-fit:cover;border-radius:10px;border:1px solid var(--line);background:#fafafa}.thumbs{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.thumbs img{width:74px;height:74px;object-fit:cover;border-radius:10px;border:1px solid var(--line);background:#fafafa}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
     .login{min-height:100vh;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,var(--soft),#fff)}.login-card{width:min(430px,100%);background:#fff;border:1px solid var(--line);border-radius:18px;padding:28px;box-shadow:0 18px 50px rgba(38,18,48,.12)}.login-card h1{margin:0 0 8px;color:var(--deep)}.error{background:#FDECEA;color:var(--danger);padding:10px 12px;border-radius:10px;margin-bottom:12px;font-weight:700}
     details summary{cursor:pointer;font-weight:800;color:var(--p)}.inline{display:inline}.nowrap{white-space:nowrap}.highlight{border:2px solid #E8A317}
     @media(max-width:820px){.layout{display:block}aside{position:static;height:auto;border-left:0;border-bottom:1px solid var(--line)}.logout{position:static;margin-top:14px}main{padding:18px}.stats,.two,.filters{grid-template-columns:1fr}.top{display:block}.imgs img{height:150px}table{display:block;overflow-x:auto;white-space:nowrap}}
@@ -257,6 +274,128 @@ function createAdminDashboard({
           <button>تطبيق</button>
         </form>
         <section class="panel"><table><thead><tr><th>المستخدم</th><th>الهاتف</th><th>النوع</th><th>الحالة</th><th>تاريخ التسجيل</th><th>تفاصيل</th><th>إجراء</th></tr></thead><tbody>${rows || '<tr><td colspan="7">لا توجد نتائج.</td></tr>'}</tbody></table></section>`
+    }));
+  }
+
+  async function renderJobs(req, res) {
+    const q = String(req.query.q || '').trim();
+    const status = String(req.query.status || '').trim();
+    const filter = {};
+    if (status) filter.status = status;
+    if (q) {
+      filter.$or = [
+        { title: { $regex: q, $options: 'i' } },
+        { category: { $regex: q, $options: 'i' } },
+        { city: { $regex: q, $options: 'i' } },
+        { area: { $regex: q, $options: 'i' } }
+      ];
+    }
+    const jobs = await cols().jobs.find(filter).sort({ createdAt: -1, _id: -1 }).limit(200).toArray();
+    const userIds = [...new Set(jobs.flatMap(job => [job.clientId, job.chosenCraftsman]).filter(Boolean))];
+    const users = await cols().users.find({ id: { $in: userIds } }, { projection: { id: 1, name: 1, phone: 1 } }).toArray();
+    const userById = new Map(users.map(user => [user.id, user]));
+    const rows = jobs.map(job => {
+      const client = userById.get(job.clientId);
+      const craftsman = userById.get(job.chosenCraftsman);
+      const photos = (job.photos || []).slice(0, 3).map(photo => (
+        `<a href="${escapeHtml(photo)}" target="_blank"><img src="${escapeHtml(photo)}" alt="صورة الطلب"></a>`
+      )).join('');
+      return `<tr>
+        <td><strong>${escapeHtml(job.title)}</strong><br><span class="muted">${escapeHtml(job.desc || '').slice(0, 140)}</span></td>
+        <td>${escapeHtml(job.category)}<br><span class="muted">${escapeHtml(job.city || '')} · ${escapeHtml(job.area || '')}</span></td>
+        <td>${client ? `${escapeHtml(client.name)}<br><span class="muted">${escapeHtml(client.phone)}</span>` : escapeHtml(job.clientId || '')}</td>
+        <td>${craftsman ? `${escapeHtml(craftsman.name)}<br><span class="muted">${escapeHtml(craftsman.phone)}</span>` : '<span class="muted">لم يتم اختيار حرفي</span>'}</td>
+        <td>${jobStatusBadge(job.status)}<br><span class="muted">${fmtDate(job.createdAt)}</span></td>
+        <td><div class="thumbs">${photos || '<span class="muted">لا توجد صور</span>'}</div></td>
+        <td>
+          <form method="post" action="/admin/jobs/${encodeURIComponent(job.id)}/status">${csrfInput(req)}
+            <select name="status">
+              ${['open', 'matched', 'done', 'reviewed', 'cancelled'].map(item => `<option value="${item}" ${job.status === item ? 'selected' : ''}>${escapeHtml({ open: 'مفتوح', matched: 'متفق عليه', done: 'منجز', reviewed: 'تم تقييمه', cancelled: 'ملغى' }[item])}</option>`).join('')}
+            </select>
+            <input name="cancelReason" value="${escapeHtml(job.cancelReason || '')}" placeholder="سبب الإلغاء عند الحاجة" style="margin-top:8px">
+            <button class="secondary" style="margin-top:8px;width:100%">حفظ</button>
+          </form>
+        </td>
+      </tr>`;
+    }).join('');
+    res.send(renderShell(req, {
+      title: 'الطلبات',
+      active: '/admin/jobs',
+      content: `${pageHeader('الطلبات', 'متابعة الطلبات الجديدة وحالاتها وصورها')}
+        <form class="filters" style="grid-template-columns:2fr 1fr auto" method="get" action="/admin/jobs">
+          <input name="q" value="${escapeHtml(q)}" placeholder="بحث بعنوان الطلب، المهنة، المدينة أو الحي">
+          <select name="status">
+            <option value="">كل الحالات</option>
+            <option value="open" ${status === 'open' ? 'selected' : ''}>مفتوح</option>
+            <option value="matched" ${status === 'matched' ? 'selected' : ''}>متفق عليه</option>
+            <option value="done" ${status === 'done' ? 'selected' : ''}>منجز</option>
+            <option value="reviewed" ${status === 'reviewed' ? 'selected' : ''}>تم تقييمه</option>
+            <option value="cancelled" ${status === 'cancelled' ? 'selected' : ''}>ملغى</option>
+          </select>
+          <button>عرض</button>
+        </form>
+        <section class="panel"><table><thead><tr><th>الطلب</th><th>التصنيف والمكان</th><th>العميل</th><th>الحرفي المختار</th><th>الحالة</th><th>الصور</th><th>إجراء</th></tr></thead><tbody>${rows || '<tr><td colspan="7">لا توجد طلبات.</td></tr>'}</tbody></table></section>`
+    }));
+  }
+
+  async function renderMessages(req, res) {
+    const messages = await cols().messages.find({}).sort({ at: -1, _id: -1 }).limit(200).toArray();
+    const userIds = [...new Set(messages.flatMap(message => [message.senderId, message.receiverId]).filter(Boolean))];
+    const jobIds = [...new Set(messages.map(message => message.jobId).filter(Boolean))];
+    const [users, jobs] = await Promise.all([
+      cols().users.find({ id: { $in: userIds } }, { projection: { id: 1, name: 1, phone: 1 } }).toArray(),
+      cols().jobs.find({ id: { $in: jobIds } }, { projection: { id: 1, title: 1 } }).toArray()
+    ]);
+    const userById = new Map(users.map(user => [user.id, user]));
+    const jobById = new Map(jobs.map(job => [job.id, job]));
+    const rows = messages.map(message => {
+      const sender = userById.get(message.senderId);
+      const receiver = userById.get(message.receiverId);
+      const job = jobById.get(message.jobId);
+      return `<tr>
+        <td>${fmtDate(message.at)}</td>
+        <td>${job ? escapeHtml(job.title) : escapeHtml(message.jobId || '')}</td>
+        <td>${sender ? `${escapeHtml(sender.name)}<br><span class="muted">${escapeHtml(sender.phone)}</span>` : escapeHtml(message.senderId || '')}</td>
+        <td>${receiver ? `${escapeHtml(receiver.name)}<br><span class="muted">${escapeHtml(receiver.phone)}</span>` : escapeHtml(message.receiverId || '')}</td>
+        <td>${escapeHtml(message.text || '')}</td>
+        <td>${message.image ? `<div class="thumbs"><a href="${escapeHtml(message.image)}" target="_blank"><img src="${escapeHtml(message.image)}" alt="صورة الرسالة"></a></div>` : '<span class="muted">لا توجد صورة</span>'}</td>
+      </tr>`;
+    }).join('');
+    res.send(renderShell(req, {
+      title: 'الرسائل',
+      active: '/admin/messages',
+      content: `${pageHeader('الرسائل', 'عرض آخر المحادثات والصور المرسلة داخل الطلبات')}
+        <section class="panel"><table><thead><tr><th>الوقت</th><th>الطلب</th><th>المرسل</th><th>المستلم</th><th>النص</th><th>الصورة</th></tr></thead><tbody>${rows || '<tr><td colspan="6">لا توجد رسائل بعد.</td></tr>'}</tbody></table></section>`
+    }));
+  }
+
+  async function renderNotifications(req, res) {
+    const notifications = await cols().notifications.find({}).sort({ at: -1, _id: -1 }).limit(250).toArray();
+    const userIds = [...new Set(notifications.map(notification => notification.userId).filter(Boolean))];
+    const jobIds = [...new Set(notifications.map(notification => notification.jobId).filter(Boolean))];
+    const [users, jobs] = await Promise.all([
+      cols().users.find({ id: { $in: userIds } }, { projection: { id: 1, name: 1, phone: 1 } }).toArray(),
+      cols().jobs.find({ id: { $in: jobIds } }, { projection: { id: 1, title: 1 } }).toArray()
+    ]);
+    const userById = new Map(users.map(user => [user.id, user]));
+    const jobById = new Map(jobs.map(job => [job.id, job]));
+    const rows = notifications.map(notification => {
+      const user = userById.get(notification.userId);
+      const job = jobById.get(notification.jobId);
+      return `<tr>
+        <td>${fmtDate(notification.at)}</td>
+        <td>${user ? `${escapeHtml(user.name)}<br><span class="muted">${escapeHtml(user.phone)}</span>` : escapeHtml(notification.userId || '')}</td>
+        <td>${escapeHtml(notification.type || '')}</td>
+        <td>${escapeHtml(notification.text || '')}</td>
+        <td>${job ? escapeHtml(job.title) : escapeHtml(notification.jobId || '')}</td>
+        <td>${notificationReadBadge(notification.read)}</td>
+      </tr>`;
+    }).join('');
+    res.send(renderShell(req, {
+      title: 'الإشعارات',
+      active: '/admin/notifications',
+      content: `${pageHeader('الإشعارات', 'مراقبة آخر إشعارات المستخدمين وحالة القراءة')}
+        <section class="panel"><table><thead><tr><th>الوقت</th><th>المستخدم</th><th>النوع</th><th>النص</th><th>الطلب</th><th>الحالة</th></tr></thead><tbody>${rows || '<tr><td colspan="6">لا توجد إشعارات بعد.</td></tr>'}</tbody></table></section>`
     }));
   }
 
@@ -452,6 +591,27 @@ function createAdminDashboard({
     await logAudit('admin.user.toggle', req, { userId: user.id, phone: user.phone, result: disabling ? 'disabled' : 'enabled' });
     res.redirect('/admin/users');
   }));
+  router.get('/jobs', asyncRoute(renderJobs));
+  router.post('/jobs/:id/status', asyncRoute(async (req, res) => {
+    const allowed = ['open', 'matched', 'done', 'reviewed', 'cancelled'];
+    const status = String(req.body.status || '').trim();
+    if (!allowed.includes(status)) return res.status(400).send('حالة الطلب غير صحيحة');
+    const job = await cols().jobs.findOne({ id: req.params.id });
+    if (!job) return res.status(404).send('الطلب غير موجود');
+    await cols().jobs.updateOne(
+      { id: job.id },
+      { $set: { status, cancelReason: status === 'cancelled' ? String(req.body.cancelReason || '').trim().slice(0, 300) || null : null } }
+    );
+    await logAudit('admin.job.status', req, {
+      userId: job.clientId,
+      result: status,
+      targetId: job.id,
+      meta: { previousStatus: job.status, source: 'admin-dashboard' }
+    });
+    res.redirect('/admin/jobs');
+  }));
+  router.get('/messages', asyncRoute(renderMessages));
+  router.get('/notifications', asyncRoute(renderNotifications));
   router.get('/verifications', asyncRoute(renderVerifications));
   router.post('/verifications/:id/decision', asyncRoute(async (req, res) => {
     const status = ['approved', 'rejected'].includes(req.body.status) ? req.body.status : null;
